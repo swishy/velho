@@ -491,6 +491,71 @@ memdeferapply(struct memtls *tls, struct membuf *buf, void *ptr, long type)
     }
 }
 
+/* overflow spill for full defer rings: free() must never block on a
+ * parked owner - nodes are mmap-chained under one global lock, and each
+ * owner drains its share (nodes tagged with the owning tls) */
+struct memspill {
+    struct memspill  *next;
+    struct memtls    *tls;
+    struct membuf    *buf;
+    void             *ptr;
+    long              type;
+};
+static struct memspill *g_spill;
+static volatile m_atomic_t g_spilllk;
+
+static void
+memspillpush(struct memtls *tls, struct membuf *buf, void *ptr, long type)
+{
+    struct memspill *n = mapanon(-1, sizeof(struct memspill), 0);
+
+    if (n == MAP_FAILED) {
+
+        return;                     /* drop (leak) rather than block */
+    }
+    n->tls = tls;
+    n->buf = buf;
+    n->ptr = ptr;
+    n->type = type;
+    n->next = NULL;
+    while (__atomic_test_and_set(&g_spilllk, __ATOMIC_ACQUIRE)) {
+        m_waitspin();
+    }
+    n->next = g_spill;
+    g_spill = n;
+    __atomic_clear(&g_spilllk, __ATOMIC_RELEASE);
+
+    return;
+}
+
+static void
+memspilldrain(struct memtls *tls)
+{
+    struct memspill **pp;
+    struct memspill  *n;
+
+    if (!__atomic_load_n(&g_spill, __ATOMIC_ACQUIRE)) {
+
+        return;
+    }
+    while (__atomic_test_and_set(&g_spilllk, __ATOMIC_ACQUIRE)) {
+        m_waitspin();
+    }
+    pp = &g_spill;
+    while ((n = *pp)) {
+        if (n->tls == tls && n->buf && n->buf->queue) {
+            memdeferapply(tls, n->buf, n->ptr, n->type);
+            *pp = n->next;
+            unmapanon(n, sizeof(struct memspill));
+        } else {
+            pp = &n->next;
+        }
+    }
+    __atomic_clear(&g_spilllk, __ATOMIC_RELEASE);
+
+    return;
+}
+
 static void
 memdeferdrain(struct memtls *tls)
 {
@@ -510,6 +575,7 @@ memdeferdrain(struct memtls *tls)
         tls->defertail++;
     }
     __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+    memspilldrain(tls);
 
     return;
 }
@@ -523,22 +589,22 @@ memdeferpush(struct memtls *tls, struct membuf *buf, void *ptr, long type)
     while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
         m_waitspin();
     }
-    long spins = 0;
-    while (tls->deferhead - tls->defertail >= MEM_DEFER_N) {
-        if (++spins > (1L << 20)
-            && !__atomic_load_n(&tls->alive, __ATOMIC_ACQUIRE)) {
-            /* owner exited: nobody will drain - apply directly under the
-             * ring lock (serialised against other dead-owner applies) */
+    if (UNLIKELY(tls->deferhead - tls->defertail >= MEM_DEFER_N)) {
+        /* ring full: never block on a parked owner - spill (dead owners
+         * may also apply directly: nobody will race them) */
+        int alive = __atomic_load_n(&tls->alive, __ATOMIC_ACQUIRE);
+        __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+        if (alive) {
+            memspillpush(tls, buf, ptr, type);
+        } else {
+            while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
+                m_waitspin();
+            }
             memdeferapply(tls, buf, ptr, type);
             __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+        }
 
-            return;
-        }
-        __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
-        m_waitspin();
-        while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
-            m_waitspin();
-        }
+        return;
     }
     {
         struct memdefer *d = &tls->defer[tls->deferhead % MEM_DEFER_N];

@@ -16,6 +16,8 @@ cc=${CC:-cc}
     "$src/c/malloc-reenter.c" -o "$out/test-tabhash"
 "$cc" -std=gnu11 "$opt" -g -fno-builtin "$src/c/malloc-alignment-test.c" \
     -o "$out/malloc-alignment-test"
+"$cc" -std=gnu11 "$opt" -g -pthread "$src/c/malloc-parked-test.c" \
+    -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-parked-test"
 "$cc" -std=gnu11 "$opt" -g -pthread "$src/c/malloc-xfree-mt.c" \
     -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-xfree-mt"
 printf '%s\n' "$out/libvelhomalloc.so"
