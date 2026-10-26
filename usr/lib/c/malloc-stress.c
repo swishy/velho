@@ -36,22 +36,6 @@ onsegv2(int sig, siginfo_t *si, void *uc)
         "VERIFY-SEGV addr=%p i=%d ptr=%p sz=%zu\n",
         si->si_addr, g_cur_i, g_cur_ptr, g_cur_sz);
     if (o > 0) { ssize_t w = write(2, b, o); (void)w; }
-    {
-        extern struct bigunmap2 { unsigned long page; size_t size; } *g_bigu_pub;
-        extern unsigned *g_bigui_pub;
-        unsigned n = *g_bigui_pub;
-        for (unsigned k = n > 64 ? n - 64 : 0; k < n; k++) {
-            struct bigunmap2 *u = &g_bigu_pub[k % 256];
-            unsigned long vp = (unsigned long)g_cur_ptr;
-            if (vp >= u->page && vp < u->page + u->size) {
-                char b2[160];
-                int o2 = snprintf(b2, 150,
-                    "KILLED-BY-BIG page=%lx size=%zu (unmap #%u)\n",
-                    u->page, u->size, k);
-                if (o2 > 0) { ssize_t w2 = write(2, b2, o2); (void)w2; }
-            }
-        }
-    }
     if (t_memtls) {
         for (int tbl = 0; tbl < 2; tbl++) {
             for (int q = 0; q < 64; q++) {

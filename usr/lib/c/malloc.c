@@ -8,7 +8,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
-#include <pthread.h>
 #include <sys/types.h>
 
 #include <zero/cdefs.h>
@@ -28,19 +27,6 @@ void meminit(struct memglob *mem);
  * called from every API entry so pre-constructor allocations can never
  * observe unwired global queues (GAP-FILL(vs)) */
 static void shim_init(void);
-
-/* thread exit: mark this TLS domain dead - remote frees onto a full
- * ring may then apply directly instead of waiting for a drain that will
- * never come */
-static void
-thread_dtor(void *p)
-{
-    struct memtls *tls = p;
-
-    if (tls) {
-        __atomic_store_n(&tls->alive, 0, __ATOMIC_RELEASE);
-    }
-}
 
 shim_tls_init(void)
 {
@@ -74,17 +60,6 @@ shim_tls_init(void)
             unmapanon(tls, sizeof(struct memtls));
 
             return;
-        }
-        __atomic_store_n(&tls->alive, 1, __ATOMIC_RELEASE);
-        { static pthread_key_t dk;
-          if (!dk) {
-              if (pthread_key_create(&dk, thread_dtor)) {
-                  /* no TSS: treat as always-alive (rings drain at alloc) */
-              }
-          }
-          if (dk) {
-              pthread_setspecific(dk, tls);
-          }
         }
     }
 }

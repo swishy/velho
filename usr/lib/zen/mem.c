@@ -255,15 +255,18 @@ memnewbuf(unsigned long qid, long type)
     return buf;
 }
 
+#define MEM_SEALED ((m_atomic_t)-1)
+
 static void *
 memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
 {
     struct membufq *queue = type == MEM_BLK
         ? &t_memtls->blktab[qid] : &t_memtls->runtab[qid];
-    struct membuf *buf = queue->head;
+    struct membuf *buf;
     int8_t *ptr;
     size_t size = type == MEM_BLK ? memblksize(qid) : memrunsize(qid);
-    if (!buf) {
+retry:
+    if (!queue->head) {
         struct membufq *glob = type == MEM_BLK
             ? &g_mem.blktab[qid] : &g_mem.runtab[qid];
         mtlkfmtx(&glob->mtx);
@@ -281,23 +284,66 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
                 return NULL;
             }
         }
+        buf->ofs = 0;
+        mtlkfmtx(&queue->mtx);
         buf->queue = queue;
         queue->nbuf++;
         memqueuebuf(queue, buf);
+        mtunlkfmtx(&queue->mtx);
+    }
+    /* The take pairs with the release/seal transition under the queue
+     * lock: a foreign last-free may otherwise recycle the buffer's
+     * header between the head read and the take. Uncontended on the
+     * single-thread hot path. */
+    mtlkfmtx(&queue->mtx);
+    buf = queue->head;
+    if (!buf) {
+        mtunlkfmtx(&queue->mtx);
+        goto retry;
     }
     if (type == MEM_BLK) {
-        ptr = (int8_t *)buf->tab[buf->ofs++];
-        if (buf->ofs == buf->max) {
-            memdequebuf(queue, buf);
+        m_atomic_t old = __atomic_fetch_add(&buf->ofs, 1, __ATOMIC_ACQ_REL);
+        if (old >= (m_atomic_t)buf->max) {
+            mtunlkfmtx(&queue->mtx);
+            if (old > (m_atomic_t)buf->max) {
+                __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
+                m_waitspin();       /* sealed mid-flight */
+                goto retry;
+            }
+            mtlkfmtx(&queue->mtx);
+            if (buf == queue->head) {
+                memdequebuf(queue, buf);   /* exhausted */
+            }
+            mtunlkfmtx(&queue->mtx);
+            goto retry;
         }
+        ptr = (int8_t *)buf->tab[old];
     } else {
-        unsigned long index = m_ctz(buf->bits);
+        uintptr_t bits = __atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE);
+        if (!bits || buf->ofs == MEM_SEALED) {
+            if (buf == queue->head
+                && (!__atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE)
+                    || buf->ofs == MEM_SEALED)) {
+                memdequebuf(queue, buf);
+            }
+            mtunlkfmtx(&queue->mtx);
+            goto retry;
+        }
+        unsigned long index = m_ctz(bits);
+        uintptr_t next = bits & (bits - 1);
+        if (!__atomic_compare_exchange_n(&buf->bits, &bits, next, 1,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            mtunlkfmtx(&queue->mtx);
+            goto retry;
+        }
         ptr = buf->adr + index * size;
-        buf->bits &= buf->bits - 1;
-        if (!buf->bits) {
-            memdequebuf(queue, buf);
+        if (!next && buf == queue->head) {
+            memdequebuf(queue, buf);       /* exhausted */
         }
     }
+    mtunlkfmtx(&queue->mtx);
+
     /* Ordinary blocks/runs already satisfy the minimum alignment. */
     if (align > (type == MEM_BLK ? CLSIZE : PAGESIZE)) {
         int8_t *aligned = memalignptr(ptr, align);
@@ -317,11 +363,28 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
 static void
 memreleaseempty(struct membuf *buf, long type)
 {
+    /* caller holds the owning queue lock; the state was re-derived from
+     * the atomic mark, so the buffer is genuinely empty */
     struct membufq *queue = buf->queue;
     unsigned long qid = queue->qid;
     long limit = type == MEM_BLK ? memnblktlsbuf(qid) : memnruntlsbuf(qid);
     if (queue->nbuf <= limit) {
-        return;
+        return;                     /* keep the empty buffer local */
+    }
+    m_atomic_t exp = 0;
+    if (type == MEM_BLK) {
+        if (!__atomic_compare_exchange_n(&buf->ofs, &exp, MEM_SEALED, 0,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            return;                 /* an allocator took a block */
+        }
+    } else {
+        uintptr_t bits = __atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE);
+        uintptr_t full = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
+        if (bits != full || buf->ofs == MEM_SEALED) {
+            return;
+        }
+        buf->ofs = MEM_SEALED;      /* under the queue lock */
     }
     memdequebuf(queue, buf);
     queue->nbuf--;
@@ -330,6 +393,7 @@ memreleaseempty(struct membuf *buf, long type)
     limit = type == MEM_BLK ? memnblkbuf(qid) : memnrunbuf(qid);
     mtlkfmtx(&glob->mtx);
     if (glob->nbuf < limit) {
+        buf->ofs = 0;               /* unseal: reusable from the reserve */
         buf->queue = glob;
         glob->nbuf++;
         memqueuebuf(glob, buf);
@@ -381,20 +445,13 @@ memgetbig(size_t size, size_t align, size_t *retsize)
 
 /* Allocate from the size class directly; only explicit callers request
  * usable capacity. malloc's ordinary path does not need to calculate it. */
-static void memdeferdrain(struct memtls *tls);
-
 void *
 memget(size_t size, size_t align, size_t *retsize)
 {
-    /* owning thread activity: drain remote frees in passing (two
-     * compares when empty; allocators that never free must still drain) */
-    if (t_memtls && UNLIKELY(t_memtls->defertail != t_memtls->deferhead)) {
-        memdeferdrain(t_memtls);
-    }
-
     size_t aln = max(align, MEM_ALIGN_MIN);
     size_t alnsz = memalnsize(size, aln);
     unsigned long qid;
+
     if (!size) {
         return NULL;
     }
@@ -413,210 +470,8 @@ memget(size_t size, size_t align, size_t *retsize)
     if (qid < MEM_RUN_QUEUES) {
         return memgetsmall(qid, MEM_RUN, aln, retsize);
     }
+
     return memgetbig(alnsz, aln, retsize);
-}
-
-#define memsize(ptr) 0 /* FIXME */
-void *
-memresize(void *ptr, size_t size, size_t align, long flg)
-{
-    size_t      alnsz = memalnsize(size, align);
-    size_t      srcsz = (ptr) ? memsize(ptr) : 0;
-    void       *adr = (ptr) && srcsz >= alnsz ? ptr : NULL;
-    size_t      cpysz = 0;
-    size_t      destsz;
-
-    if (!adr) {
-        if (ptr) {
-            adr = memget(size, align, &destsz);
-        }
-
-        return NULL;
-    }
-#if 0
-    if ((!ptr && (flg & MEM_ALLOC_ON_NULL))
-        || !adr) {
-        adr = memget(size, align, &destsz);
-    } else {
-        adr = ptr;
-    }
-#endif
-    if (adr) {
-        if ((ptr) && adr != ptr) {
-            cpysz = min(srcsz, destsz);
-            memcpy(adr, ptr, cpysz);
-        }
-    }
-    if (!adr) {
-        errno = ENOMEM;
-        if (flg & MEM_FREE_ON_FAILURE) {
-            memput(ptr);
-        }
-    }
-
-    return adr;
-}
-
-/* Kept for the existing stress harness's diagnostic ABI. */
-static struct bigunmap { uintptr_t page; size_t size; } g_bigu[256];
-static unsigned g_bigui;
-struct bigunmap *g_bigu_pub = g_bigu;
-unsigned *g_bigui_pub = &g_bigui;
-
-/* remote-free: apply a deferred free on the owning thread */
-static void
-memdeferapply(struct memtls *tls, struct membuf *buf, void *ptr, long type)
-{
-    struct membufq *queue = buf->queue;
-    unsigned long   qid = queue->qid;
-
-    if (type == MEM_BLK) {
-        size_t index = memblknum(qid, buf, ptr);
-        if (buf->ofs == buf->max) {
-            memqueuebuf(queue, buf);
-        }
-        buf->tab[--buf->ofs] = (uintptr_t)buf->adr + index * memblksize(qid);
-        if (!buf->ofs) {
-            memreleaseempty(buf, type);
-        }
-    } else {
-        size_t index = memrunnum(qid, buf, ptr);
-        if (!buf->bits) {
-            memqueuebuf(queue, buf);
-        }
-        buf->bits |= (uintptr_t)1 << index;
-        if (buf->bits == (UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max))) {
-            memreleaseempty(buf, type);
-        }
-    }
-}
-
-/* overflow spill for full defer rings: free() must never block on a
- * parked owner - nodes are mmap-chained under one global lock, and each
- * owner drains its share (nodes tagged with the owning tls) */
-struct memspill {
-    struct memspill  *next;
-    struct memtls    *tls;
-    struct membuf    *buf;
-    void             *ptr;
-    long              type;
-};
-static struct memspill *g_spill;
-static volatile m_atomic_t g_spilllk;
-
-static void
-memspillpush(struct memtls *tls, struct membuf *buf, void *ptr, long type)
-{
-    struct memspill *n = mapanon(-1, sizeof(struct memspill), 0);
-
-    if (n == MAP_FAILED) {
-
-        return;                     /* drop (leak) rather than block */
-    }
-    n->tls = tls;
-    n->buf = buf;
-    n->ptr = ptr;
-    n->type = type;
-    n->next = NULL;
-    while (__atomic_test_and_set(&g_spilllk, __ATOMIC_ACQUIRE)) {
-        m_waitspin();
-    }
-    n->next = g_spill;
-    g_spill = n;
-    __atomic_clear(&g_spilllk, __ATOMIC_RELEASE);
-
-    return;
-}
-
-static void
-memspilldrain(struct memtls *tls)
-{
-    struct memspill **pp;
-    struct memspill  *n;
-
-    if (!__atomic_load_n(&g_spill, __ATOMIC_ACQUIRE)) {
-
-        return;
-    }
-    while (__atomic_test_and_set(&g_spilllk, __ATOMIC_ACQUIRE)) {
-        m_waitspin();
-    }
-    pp = &g_spill;
-    while ((n = *pp)) {
-        if (n->tls == tls && n->buf && n->buf->queue) {
-            memdeferapply(tls, n->buf, n->ptr, n->type);
-            *pp = n->next;
-            unmapanon(n, sizeof(struct memspill));
-        } else {
-            pp = &n->next;
-        }
-    }
-    __atomic_clear(&g_spilllk, __ATOMIC_RELEASE);
-
-    return;
-}
-
-static void
-memdeferdrain(struct memtls *tls)
-{
-    if (tls->defertail == tls->deferhead) {
-
-        return;
-    }
-    while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
-        m_waitspin();
-    }
-    while (tls->defertail != tls->deferhead) {
-        struct memdefer *d = &tls->defer[tls->defertail % MEM_DEFER_N];
-
-        if (d->buf && d->buf->queue) {
-            memdeferapply(tls, d->buf, d->ptr, d->type);
-        }
-        tls->defertail++;
-    }
-    __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
-    memspilldrain(tls);
-
-    return;
-}
-
-/* MPSC push, spinlocked: the remote-free path is the slow path - an
- * obviously-correct lock beats a clever lock-free ring. A full ring
- * waits for the owner to drain (the owner never blocks on producers). */
-static void
-memdeferpush(struct memtls *tls, struct membuf *buf, void *ptr, long type)
-{
-    while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
-        m_waitspin();
-    }
-    if (UNLIKELY(tls->deferhead - tls->defertail >= MEM_DEFER_N)) {
-        /* ring full: never block on a parked owner - spill (dead owners
-         * may also apply directly: nobody will race them) */
-        int alive = __atomic_load_n(&tls->alive, __ATOMIC_ACQUIRE);
-        __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
-        if (alive) {
-            memspillpush(tls, buf, ptr, type);
-        } else {
-            while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
-                m_waitspin();
-            }
-            memdeferapply(tls, buf, ptr, type);
-            __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
-        }
-
-        return;
-    }
-    {
-        struct memdefer *d = &tls->defer[tls->deferhead % MEM_DEFER_N];
-
-        d->buf = buf;
-        d->ptr = ptr;
-        d->type = type;
-        tls->deferhead++;
-    }
-    __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
-
-    return;
 }
 
 void
@@ -635,27 +490,34 @@ memput(void *ptr)
     }
     struct membuf *buf = memhashbuf(&hash);
     struct membufq *queue = buf->queue;
-    /* Removal returned the packed owner. Decode it directly, before a
-     * last free can release the slab; no second hash lookup is needed. */
-    if (queue->tls && queue->tls != (struct memtls *)t_memtls) {
-        /* remote free: the buffer belongs to another thread's domain -
-         * defer; the owner applies it (cross-thread mutation of its
-         * buffers is unsynchronised otherwise) */
-        memdeferpush(queue->tls, buf, ptr, type);
-
-        return;
+    unsigned long qid = queue->qid;
+    /* Removal returned the packed owner. The mark itself is atomic
+     * (bits/ofs are RMW words - lock bts/btr is atomic on any silicon),
+     * so ANY thread applies the free directly; the block is allocatable
+     * immediately. Queue membership changes only at lifecycle
+     * transitions, under the queue lock. */
+    mtlkfmtx(&queue->mtx);
+    if (type == MEM_BLK) {
+        size_t index = memblknum(qid, buf, ptr);
+        m_atomic_t old = __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
+        buf->tab[old - 1] = (uintptr_t)buf->adr + index * memblksize(qid);
+        if (old == (m_atomic_t)buf->max) {
+            memqueuebuf(queue, buf);       /* revival: exactly-once */
+        }
+        if (old == 1) {
+            memreleaseempty(buf, type);    /* last free */
+        }
+    } else {
+        size_t index = memrunnum(qid, buf, ptr);
+        uintptr_t bit = (uintptr_t)1 << index;
+        uintptr_t old = __atomic_fetch_or(&buf->bits, bit, __ATOMIC_ACQ_REL);
+        uintptr_t full = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
+        if (!old) {
+            memqueuebuf(queue, buf);       /* revival: exactly-once */
+        }
+        if ((old | bit) == full) {
+            memreleaseempty(buf, type);    /* last free */
+        }
     }
-    if (!queue->tls) {
-        /* global-reserve buffer: mutate under the queue lock (mirrors
-         * the allocation path) */
-        mtlkfmtx(&queue->mtx);
-        memdeferapply(t_memtls, buf, ptr, type);
-        mtunlkfmtx(&queue->mtx);
-
-        return;
-    }
-    memdeferapply(t_memtls, buf, ptr, type);
-    /* own domain: drain remote frees in passing (bounded, cheap when
-     * empty) */
-    memdeferdrain(t_memtls);
+    mtunlkfmtx(&queue->mtx);
 }

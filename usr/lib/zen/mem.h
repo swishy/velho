@@ -174,23 +174,11 @@ struct membufq {
     long                pad[2]; // one cache line per queue
 };
 
+#define MEM_SEALED ((m_atomic_t)-1)
+
 struct memtls {
     struct membufq      blktab[MEM_BLK_QUEUES];
     struct membufq      runtab[MEM_RUN_QUEUES];
-    /* remote-free ring: cross-thread frees are deferred here (MPSC) and
-     * applied by the owning thread on its next allocator activity. The
-     * freeing thread has already consumed the page-hash entry, so the
-     * handoff carries the decoded (buffer, pointer, type) tuple. */
-#define MEM_DEFER_N 4096
-    struct memdefer {
-        struct membuf  *buf;
-        void           *ptr;
-        long            type;
-    }                   defer[MEM_DEFER_N];
-    volatile m_atomic_t deferlk;     /* ring spinlock */
-    volatile m_atomic_t alive;       /* owner thread still running */
-    m_atomic_t          deferhead;   /* producer index (under lock) */
-    m_atomic_t          defertail;   /* owner index (under lock) */
 };
 
 /* engine-internal */
