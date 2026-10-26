@@ -1,10 +1,6 @@
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <string.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <errno.h>
 #include <mt/mtx.h>
 #include <zen/sys/unix.h>
@@ -18,21 +14,6 @@ THREADLOCAL struct memtls      *t_memtls;
 struct memtls                  *t_memtls_p;
 struct tabhashtab              *g_memhashbuf;
 
-struct qop { char op; const struct membufq *q; const struct membuf *b; long nbuf; };
-static struct qop g_qops[512];
-static unsigned g_qopi;
-struct qop2 *g_qops2_alias = (struct qop2 *)g_qops;
-unsigned *g_qopi2 = &g_qopi;
-struct qop2 { char op; const void *q; const void *b; long nbuf; };
-struct qop2 *g_qops2 = (struct qop2 *)0;
-static void
-qlog(char op, const struct membufq *q, const struct membuf *b)
-{
-    (void)op; (void)q; (void)b;   /* diagnostics compiled out */
-}
-static void mempurgepage(uintptr_t page, struct membuf *own);
-static int  membufowns(struct membuf *buf, uintptr_t page);
-
 #define memblkslabsize(qid)                                             \
     (((qid) <= MEM_BLK_MID_QUEUE_MIN)                                   \
      ? (MEM_BLK_MIN_SLAB >> 2)                                          \
@@ -42,29 +23,9 @@ static int  membufowns(struct membuf *buf, uintptr_t page);
 static void
 meminitblktabs(struct memglob *mem)
 {
-    double              slabsz;
-    double              blksz;
-    double              nblk;
-    double              multi;
-    unsigned long       qid;
-
-    /* GAP-FILL(vs): the tables were built with (qid + 1) while every
-     * accessor strides by qid (memblksize(qid) = CLSIZE * qid, qid >= 1
-     * from memblkqid) - an index-shifted table that made memblknum and
-     * memrunnum compute WRONG block/run indices, so frees set the wrong
-     * bitmap bits: premature all-free, live slabs released and re-handed
-     * (the perl corruption). Build them for the accessor stride; index 0
-     * is unused (division guard). */
-    for (qid = 1 ; qid < MEM_BLK_QUEUES ; qid++) {
-        slabsz = memblkslabsize(qid);
-        blksz = MEM_BLK_MIN * (double)qid;
-        nblk = slabsz / blksz;
-        multi = 1.0 / blksz;
-        mem->nblktab[qid] = (long)nblk;
-        mem->blkdivtab[qid] = multi;
+    for (unsigned long qid = 1; qid < MEM_BLK_QUEUES; ++qid) {
+        mem->nblktab[qid] = memblkslabsize(qid) / memblksize(qid);
     }
-
-    return;
 }
 
 #define memrunslabsize(qid)                                             \
@@ -76,23 +37,9 @@ meminitblktabs(struct memglob *mem)
 static void
 meminitruntabs(struct memglob *mem)
 {
-    double              slabsz;
-    double              runsz;
-    double              nrun;
-    double              multi;
-    unsigned long       qid;
-
-    /* GAP-FILL(vs): same index shift as the block tables - see above */
-    for (qid = 1 ; qid < MEM_RUN_QUEUES ; qid++) {
-        slabsz = (double)memrunslabsize(qid);
-        runsz = PAGESIZE * (double)qid;
-        nrun = slabsz / runsz;
-        multi = 1.0 / runsz;
-        mem->nruntab[qid] = (long)nrun;
-        mem->rundivtab[qid] = multi;
+    for (unsigned long qid = 1; qid < MEM_RUN_QUEUES; ++qid) {
+        mem->nruntab[qid] = memrunslabsize(qid) / memrunsize(qid);
     }
-
-    return;
 }
 
 void
@@ -218,7 +165,6 @@ memgetbuf(long type)
 static void
 memputbuf(struct membuf *buf, long type)
 {
-    qlog('R', NULL, buf);
     volatile struct membuf    **hdrq;
     struct membuf              *head;
 
@@ -251,850 +197,148 @@ memputbuf(struct membuf *buf, long type)
     return;
 }
 
-/* push buffer in front of queue */
-static void
-mempushbuf(struct membufq *queue, struct membuf *buf)
-{
-    qlog('U', queue, buf);
-    struct membuf       *head = queue->head;
-
-    /* GAP-FILL(vs): queue==NULL marks a header resident on the header
-     * freelist - pushing one onto a buffer queue would alias it */
-    if (!buf->queue) {
-
-        return;
-    }
-    buf->prev = NULL;
-    buf->next = head;
-    queue->nbuf++;
-    if (head) {
-        head->prev = buf;
-    } else {
-        queue->tail = buf;
-    }
-    queue->head = buf;
-
-    return;
-}
-
-static void
-mempopbuf(struct membufq *queue, struct membuf *buf)
-{
-    qlog('P', queue, buf);
-    struct membuf       *next;
-
-    /* GAP-FILL(vs): memdequebuf decrements nbuf but this pop did not, so
-     * queue counts only ever grew and the lim gates misfired */
-    queue->nbuf--;
-    next = buf->next;
-    if (next) {
-        next->prev = NULL;
-    } else {
-        queue->tail = NULL;
-    }
-    queue->head = next;
-
-    return;
-}
-
-/* queue buffer in back of queue */
+/* Queues contain only buffers with free allocations. Their head stays in
+ * place until exhausted; nbuf counts all owned buffers, including full ones. */
 static void
 memqueuebuf(struct membufq *queue, struct membuf *buf)
 {
-    qlog('Q', queue, buf);
-    struct membuf      *tail = queue->tail;
-
+    buf->prev = queue->tail;
     buf->next = NULL;
-    buf->prev = tail;
-    queue->nbuf++;
-    if (tail) {
-        tail->next = buf;
+    if (queue->tail) {
+        queue->tail->next = buf;
     } else {
         queue->head = buf;
     }
     queue->tail = buf;
-
-    return;
 }
 
-/* remove buffer from queue */
 static void
 memdequebuf(struct membufq *queue, struct membuf *buf)
 {
-    qlog('D', queue, buf);
-    struct membuf      *prev;
-    struct membuf      *next;
-
-    prev = buf->prev;
-    next = buf->next;
-    queue->nbuf--;
-    if (prev) {
-        prev->next = buf->next;
+    if (buf->prev) {
+        buf->prev->next = buf->next;
     } else {
-        queue->head = next;
+        queue->head = buf->next;
     }
-    if (next) {
-        next->prev = buf->prev;
+    if (buf->next) {
+        buf->next->prev = buf->prev;
     } else {
-        queue->tail = prev;
+        queue->tail = buf->prev;
     }
-
-    return;
+    buf->prev = buf->next = NULL;
 }
 
-/* GAP-FILL(vs): rewritten queue interaction - iterate, don't pop. The
- * upstream design unlinked a buffer at exhaustion, leaving live slabs
- * resident on NO queue: invisible to every later consistency check (and
- * to memrangebusy). Buffers now stay linked for their whole lifetime and
- * allocation simply skips exhausted ones. */
-static void *
-memgetblk(unsigned long qid, size_t align, size_t *retsize)
-{
-    int8_t             *ptr = NULL;
-    int8_t             *ret = NULL;
-    int8_t             *gptr = NULL;
-    struct membuf      *gbuf = NULL;
-    struct membuf      *buf;
-    long                ntry = 32;
-    size_t              slabsz;
-    size_t              blksz = memblksize(qid);
-    uintptr_t          *tab;
-    long                nblk;
-    long                n;
-    size_t              ofs;
-    size_t              lim;
-    size_t              diff;
-    uintptr_t           page;
-    uintptr_t           val;
-
-    /* locality: serve from the current buffer until exhausted (the raw
-     * LIFO scattered blocks across slabs - cache-miss storm) */
-    buf = t_memtls ? t_memtls->curblk[qid] : NULL;
-    if (buf && buf->ofs < buf->max && buf->adr
-        && buf->queue == &t_memtls->blktab[qid]) {
-        ptr = (int8_t *)buf->tab[buf->ofs];
-        buf->ofs++;
-        if (buf->ofs == buf->max) {
-            t_memtls->blktab[qid].nusable--;
-            t_memtls->curblk[qid] = NULL;
-        }
-        ret = memalignptr(ptr, align);
-        if (ret) {
-            size_t o2 = buf->max + memblknum(qid, buf, ret);
-            buf->tab[o2] = (uintptr_t)(ret - ptr);
-            { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_BLK);
-              uintptr_t vl = memsethashbuf(buf, qid, MEM_BLK);
-              if (!tabhashaddref(g_memhashtab, pg, vl)) {
-                  tabhashadd(g_memhashtab, pg, vl);
-              }
-              if (retsize) { *retsize = blksz; } }
-        }
-
-        return ret;
-    }
-    t_memtls->curblk[qid] = NULL;
-
-    /* magazine fast path: pop the available-stack, validating entries
-     * (stale entries - handed off, released, or re-exhausted - skip).
-     * This replaces the queue walk, which was O(live buffers) per
-     * allocation and the volume quadratic. */
-    buf = NULL;
-    if (t_memtls) {
-        struct membuf *av = t_memtls->availblk[qid];
-        struct membuf *pv = NULL;
-        while (av) {
-            if (av->ofs < av->max && av->adr
-                && av->queue == &t_memtls->blktab[qid]) {
-                break;
-            }
-            /* stale: unlink it from the stack (leaving it linked let a
-             * re-push double-link the node into a cycle) */
-            if (pv) {
-                pv->anext = av->anext;
-            } else {
-                t_memtls->availblk[qid] = av->anext;
-            }
-            av->availf = 0;
-            av->anext = NULL;
-            av = (pv ? pv->anext : t_memtls->availblk[qid]);
-        }
-        if (av) {
-            if (pv) {
-                pv->anext = av->anext;
-            } else {
-                t_memtls->availblk[qid] = av->anext;
-            }
-            av->anext = NULL;
-            av->availf = 0;
-            buf = av;
-            t_memtls->curblk[qid] = buf;   /* locality: stick to it */
-            ptr = (int8_t *)buf->tab[buf->ofs];
-            buf->ofs++;
-            if (buf->ofs == buf->max) {
-                t_memtls->blktab[qid].nusable--;
-            }
-            ret = memalignptr(ptr, align);
-            if (ret) {
-                size_t o2 = buf->max + memblknum(qid, buf, ret);
-                buf->tab[o2] = (uintptr_t)(ret - ptr);
-                { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_BLK);
-                  uintptr_t vl = memsethashbuf(buf, qid, MEM_BLK);
-                  if (!tabhashaddref(g_memhashtab, pg, vl)) {
-                      tabhashadd(g_memhashtab, pg, vl);
-                  }
-                  if (retsize) { *retsize = blksz; } }
-            }
-
-
-            return ret;
-        }
-    }
-    if (!buf) {
-        mtlkfmtx(&g_mem.blktab[qid].mtx);
-        for (buf = g_mem.blktab[qid].head; buf && buf->next != buf;
-             buf = buf->next) {
-            if (buf->ofs < buf->max) {
-                break;
-            }
-        }
-        if (buf && buf->ofs >= buf->max) {
-            buf = NULL;
-        }
-        if (buf) {
-            /* MT: allocate the block while still holding the global
-             * queue lock - releasing first let two threads walk to the
-             * same buffer and hand out the same block */
-            ofs = buf->ofs;
-            gptr = (int8_t *)buf->tab[ofs];
-            buf->ofs = ofs + 1;
-            gbuf = buf;
-        }
-        if (!buf) {
-            slabsz = memblkslabsize(qid);
-            mtunlkfmtx(&g_mem.blktab[qid].mtx);
-            buf = memgetbuf(MEM_BLK);
-            if (!buf) {
-
-                return NULL;
-            }
-            do {
-                ptr = mapanon(-1, slabsz, 0);
-                if (ptr == MAP_FAILED) {
-                    m_waitspin();
-                }
-            } while (ptr == MAP_FAILED && --ntry);
-            if (ptr == MAP_FAILED) {
-                buf->prev = buf;  /* GAP-FILL(vs): kill stale links */
-                buf->next = buf;
-                memputbuf(buf, MEM_BLK);
-                buf = NULL;
-            } else {
-                nblk = memnblk(qid);
-                buf->adr = ptr;
-                buf->size = slabsz;
-                buf->queue = &t_memtls->blktab[qid];
-                tab = buf->tab;
-                buf->max = nblk;
-                n = nblk >> 3;
-                nblk -= 8 * n;
-                while (n--) {
-                    tab[0] = (uintptr_t)ptr;
-                    tab[1] = (uintptr_t)ptr + blksz;
-                    tab[2] = (uintptr_t)ptr + 2 * blksz;
-                    tab[3] = (uintptr_t)ptr + 3 * blksz;
-                    tab[4] = (uintptr_t)ptr + 4 * blksz;
-                    tab[5] = (uintptr_t)ptr + 5 * blksz;
-                    tab[6] = (uintptr_t)ptr + 6 * blksz;
-                    tab[7] = (uintptr_t)ptr + 7 * blksz;
-                    ptr += 8 * blksz;
-                    tab += 8;
-                }
-                n = min(8, nblk);
-                switch (nblk) {
-                    case 8: tab[7] = (uintptr_t)ptr + 7 * blksz;
-                    case 7: tab[6] = (uintptr_t)ptr + 6 * blksz;
-                    case 6: tab[5] = (uintptr_t)ptr + 5 * blksz;
-                    case 5: tab[4] = (uintptr_t)ptr + 4 * blksz;
-                    case 4: tab[3] = (uintptr_t)ptr + 3 * blksz;
-                    case 3: tab[2] = (uintptr_t)ptr + 2 * blksz;
-                    case 2: tab[1] = (uintptr_t)ptr + blksz;
-                    case 1: tab[0] = (uintptr_t)ptr;
-                    case 0:
-                    default:
-
-                        break;
-                }
-                ptr = (int8_t *)buf->tab[0];
-                buf->ofs = 1;
-                mempushbuf(&t_memtls->blktab[qid], buf);
-                t_memtls->blktab[qid].nusable++;
-                buf->availf = 1;
-                buf->anext = t_memtls->availblk[qid];
-                t_memtls->availblk[qid] = buf;
-            }
-        } else {
-            /* GAP-FILL(vs): a usable global buffer stays on the global
-             * queue (visible to checks); allocate from it in place */
-            mtunlkfmtx(&g_mem.blktab[qid].mtx);
-        }
-    }
-    if (gbuf) {
-        buf = gbuf;
-        ptr = gptr;
-        ret = memalignptr(ptr, align);  /* block taken under global lock */
-    } else if (buf && ptr) {
-        /* fresh buffer: first block already selected above */
-        ret = memalignptr(ptr, align);
-    } else if (buf) {
-        ofs = buf->ofs;
-        ptr = (int8_t *)buf->tab[ofs];
-        buf->ofs = ofs + 1;             /* exhausted buffers stay linked */
-        ret = memalignptr(ptr, align);
-    }
-    if (ret) {
-        if (UNLIKELY((uintptr_t)ret < (uintptr_t)buf->adr
-                     || (uintptr_t)ret
-                        >= (uintptr_t)buf->adr + buf->size)) {
-
-            return NULL;
-        }
-        ofs = buf->max;
-        n = memblknum(qid, buf, ret);
-        ofs += n;
-        diff = ret - ptr;
-        page = memsethashpage(mempageadr(ret), MEM_BLK);
-        val = memsethashbuf(buf, qid, MEM_BLK);
-        buf->tab[ofs] = (uintptr_t)diff;
-        /* GAP-FILL(vs): blocks sharing a page REF one page entry (nref)
-         * - vendu's tabhashaddref/tabhashref machinery - instead of
-         * piling duplicate entries per block */
-        if (!tabhashaddref(g_memhashtab, page, val)) {
-            tabhashadd(g_memhashtab, page, val);
-        }
-        if (retsize) {
-            *retsize = blksz;
-        }
-    }
-
-    return ret;
-}
-
-/* GAP-FILL(vs): rewritten like memgetblk - iterate, don't pop. Buffers
- * stay linked for their whole lifetime; allocation skips exhausted ones,
- * so every live slab remains visible to consistency checks. */
-static void *
-memgetrun(unsigned long qid, size_t align, size_t *retsize)
-{
-    int8_t             *ret = NULL;
-    int8_t             *ptr = NULL;
-    int8_t             *gptr = NULL;
-    struct membuf      *gbuf = NULL;
-    long                gbits = 0;
-    long                gofs = 0;
-    long                gmask = 0;
-    struct membuf      *buf;
-    long                ntry = 32;
-    size_t              nrun;
-    size_t              slabsz;
-    size_t              runsz = memrunsize(qid);
-    long                bits;
-    long                mask;
-    long                ofs;
-    uintptr_t           page;
-    uintptr_t           val;
-    uintptr_t           diff;
-
-    /* locality: serve from the current buffer until exhausted - the
-     * raw LIFO interleaved buffers and scattered runs across slabs
-     * (cache-miss storm: scan 52ms->4.4s). The avail-stack finds the
-     * NEXT buffer only when this one dies. */
-    buf = t_memtls ? t_memtls->currun[qid] : NULL;
-    if (buf && buf->bits && buf->adr
-        && buf->queue == &t_memtls->runtab[qid]) {
-        long b2 = buf->bits;
-        long o2 = m_ctz(b2);
-        ptr = buf->adr + ((o2 << PAGESIZELOG2) * qid);
-        buf->bits = b2 & ~(1L << o2);
-        if (!buf->bits) {
-            t_memtls->runtab[qid].nusable--;
-            t_memtls->currun[qid] = NULL;   /* exhausted - next pop */
-        }
-        ret = memalignptr(ptr, align);
-        if (ret) {
-            ofs = memrunnum(qid, buf, ret);
-            buf->tab[ofs] = (uintptr_t)(ret - ptr);
-            { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_RUN);
-              uintptr_t vl = memsethashbuf(buf, qid, MEM_RUN);
-              if (!tabhashaddref(g_memhashtab, pg, vl)) {
-                  tabhashadd(g_memhashtab, pg, vl);
-              }
-              if (retsize) { *retsize = memrunsize(qid); } }
-        }
-
-        return ret;
-    }
-    t_memtls->currun[qid] = NULL;
-
-    /* magazine fast path: pop the run available-stack (see memgetblk) */
-    buf = NULL;
-    if (t_memtls) {
-        struct membuf *av = t_memtls->availrun[qid];
-        struct membuf *pv = NULL;
-        while (av) {
-            if (av->bits && av->adr
-                && av->queue == &t_memtls->runtab[qid]) {
-                break;
-            }
-            if (pv) {
-                pv->anext = av->anext;
-            } else {
-                t_memtls->availrun[qid] = av->anext;
-            }
-            av->availf = 0;
-            av->anext = NULL;
-            av = (pv ? pv->anext : t_memtls->availrun[qid]);
-        }
-        if (av) {
-            if (pv) {
-                pv->anext = av->anext;
-            } else {
-                t_memtls->availrun[qid] = av->anext;
-            }
-            av->anext = NULL;
-            av->availf = 0;
-            buf = av;
-            t_memtls->currun[qid] = buf;   /* locality: stick to it */
-            { long b2 = buf->bits;
-              long o2 = m_ctz(b2);
-              ptr = buf->adr + ((o2 << PAGESIZELOG2) * qid);
-              buf->bits = b2 & ~(1L << o2);
-              if (!buf->bits) {
-                  t_memtls->runtab[qid].nusable--;
-              }
-              ret = memalignptr(ptr, align);
-              if (ret) {
-                  ofs = memrunnum(qid, buf, ret);
-                  buf->tab[ofs] = (uintptr_t)(ret - ptr);
-                  { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_RUN);
-                    uintptr_t vl = memsethashbuf(buf, qid, MEM_RUN);
-                    if (!tabhashaddref(g_memhashtab, pg, vl)) {
-                        tabhashadd(g_memhashtab, pg, vl);
-                    }
-                    if (retsize) { *retsize = memrunsize(qid); } }
-              }
- }
-
-            return ret;
-        }
-    }
-    if (!buf) {
-        mtlkfmtx(&g_mem.runtab[qid].mtx);
-        for (buf = g_mem.runtab[qid].head; buf && buf->next != buf;
-             buf = buf->next) {
-            if (buf->bits) {
-                break;
-            }
-        }
-        if (buf && !buf->bits) {
-            buf = NULL;
-        }
-        if (buf) {
-            /* MT: select the run while holding the global queue lock */
-            gbits = buf->bits;
-            gofs = m_ctz(gbits);
-            gmask = ~(1L << gofs);
-            gofs <<= PAGESIZELOG2;
-            gofs *= qid;
-            gbits &= gmask;
-            gptr = buf->adr + gofs;
-            buf->bits = gbits;
-            gbuf = buf;
-        }
-        if (gbuf) {
-        }
-        if (!buf) {
-            slabsz = memrunslabsize(qid);
-            nrun = memnrun(qid);
-            mtunlkfmtx(&g_mem.runtab[qid].mtx);
-            buf = memgetbuf(MEM_RUN);
-            if (!buf) {
-
-                return NULL;
-            }
-            do {
-                ptr = mapanon(-1, slabsz, 0);
-                if (ptr == MAP_FAILED) {
-                    m_waitspin();
-                }
-            } while (ptr == MAP_FAILED && --ntry);
-            bits = 1L << nrun;
-            if (ptr == MAP_FAILED) {
-                buf->prev = buf;  /* GAP-FILL(vs): kill stale links */
-                buf->next = buf;
-                memputbuf(buf, MEM_RUN);
-                buf = NULL;
-            } else {
-                bits--;
-                /* first run is handed out below: clear its bit */
-                bits &= ~(uintptr_t)1;
-                buf->adr = ptr;
-                buf->size = slabsz;
-                buf->bits = bits;
-                buf->max = nrun;
-                buf->queue = &t_memtls->runtab[qid];
-                mempushbuf(&t_memtls->runtab[qid], buf);
-                t_memtls->runtab[qid].nusable++;
-                buf->availf = 1;
-                buf->anext = t_memtls->availrun[qid];
-                t_memtls->availrun[qid] = buf;
-            }
-        } else {
-            mtunlkfmtx(&g_mem.runtab[qid].mtx);
-        }
-    }
-    if (buf && ptr) {
-        /* fresh buffer: first run selected above */
-        ret = memalignptr(ptr, align);
-    } else if (buf && !gbuf) {
-        /* leftover walk branch: MUST NOT run when the global path already
-         * selected from this buffer via gbuf - it double-served (the
-         * gbuf take consumed the bit; ctz on the updated bitmap handed
-         * wild offsets, e.g. ctz(0)*stride far outside the slab) */
-        bits = buf->bits;
-        if (bits) {
-            ofs = m_ctz(bits);
-            mask = ~(1L << ofs);
-            ofs <<= PAGESIZELOG2;
-            ofs *= qid;
-            bits &= mask;
-            ptr = buf->adr + ofs;
-            buf->bits = bits;           /* exhausted stays linked */
-            ret = memalignptr(ptr, align);
-        }
-    }
-    if (gbuf && !ret) {
-        buf = gbuf;
-        ptr = gptr;
-        ret = memalignptr(ptr, align);
-    }
-    if (ret) {
-        ofs = memrunnum(qid, buf, ret);
-        diff = ret - ptr;
-        page = memsethashpage(mempageadr(ret), MEM_RUN);
-        val = memsethashbuf(buf, qid, MEM_RUN);
-        buf->tab[ofs] = (uintptr_t)diff;
-        if (!tabhashaddref(g_memhashtab, page, val)) {
-            tabhashadd(g_memhashtab, page, val);
-        }
-        if (retsize) {
-            *retsize = runsz;
-        }
-    }
-
-    return ret;
-}
-
-/* GAP-FILL(vs): page-hash entries are fungible per page - freeing a block
- * removes *an* entry of its page, not necessarily its own. When a buffer is
- * released and unmapped, any entries surviving for its pages would alias
- * whatever gets mapped there next, so release purges them. */
-static void
-mempurgebufentries(struct membuf *buf, size_t stride)
-{
-    size_t n;
-    size_t i;
-
-    if (!stride) {
-        return;
-    }
-    n = buf->size / stride;
-    if (!n) {
-        n = 1;
-    }
-    for (i = 0; i < n; i++) {
-        uintptr_t page = mempageadr(buf->adr + i * stride);
-        while (tabhashfind(g_memhashtab, page).page) {
-            tabhashrm(g_memhashtab, page);
-        }
-    }
-
-    return;
-}
-
-/* GAP-FILL(vs): ownership check from in-context pointer refs alone - the
- * page-hash entry names a buffer header, and the header names its slab
- * ([adr, adr+size)) and its queue. An entry that fails this check has
- * outlived its buffer (stale); callers drop it from the table, which
- * makes the hash self-healing without any external tracking. */
-/* GAP-FILL(vs): the allocator adding an entry for a page owns the ground
- * truth; drop any foreign entries (different buffer, or BIG leftovers)
- * still keyed there before adding. */
-static void
-mempurgepage(uintptr_t page, struct membuf *own)
-{
-    while (1) {
-        struct memhash item = tabhashfind(g_memhashtab, page);
-        long           type;
-        struct membuf  *buf;
-
-        if (!item.page) {
-
-            return;
-        }
-        type = memhashtype(&item);
-        buf = (struct membuf *)memhashbuf(&item);
-        if (type != MEM_BIG && buf == own && membufowns(buf, page)) {
-
-            return;             /* our own entry - keep it */
-        }
-        tabhashrm(g_memhashtab, page);
-    }
-}
-
-/* GAP-FILL(vs): a BIG entry cannot self-validate (it packs size, not an
- * owner), so before honoring its unmap, verify that no live buffer on any
- * queue intersects the claimed range - a stale BIG entry that happens to
- * win a page lookup must not be able to mass-unmap recycled pages. */
-static int
-memrangebusy(uintptr_t lo, size_t len)
-{
-    struct membuf *buf;
-    uintptr_t     hi = lo + len;
-    int           t;
-    unsigned long q;
-
-    for (t = 0; t < 2; t++) {
-        for (q = 0; q < MEM_BLK_QUEUES; q++) {
-            struct membufq *queue = t
-                ? &g_mem.runtab[q] : &g_mem.blktab[q];
-            for (buf = queue->head; buf; buf = buf->next) {
-                if ((uintptr_t)buf->adr < hi
-                    && (uintptr_t)buf->adr + buf->size > lo) {
-
-                    return 1;
-                }
-                if (buf == buf->next) {
-                    break;          /* unlinked marker */
-                }
-            }
-        }
-        if (t_memtls) {
-            for (q = 0; q < MEM_BLK_QUEUES; q++) {
-                struct membufq *queue = t
-                    ? &t_memtls->runtab[q] : &t_memtls->blktab[q];
-                for (buf = queue->head; buf; buf = buf->next) {
-                    if ((uintptr_t)buf->adr < hi
-                        && (uintptr_t)buf->adr + buf->size > lo) {
-
-                        return 1;
-                    }
-                    if (buf == buf->next) {
-                        break;      /* unlinked marker */
-                    }
-                }
-            }
-        }
-    }
-
-    return 0;
-}
-
-/* GAP-FILL(vs): at run-buffer release, bits may lie (a wrong-index free
- * can complete the bitmap while a run is live). Page-hash entries cannot:
- * a live run's entry is only removed by its own free. Returns 1 when the
- * slab is provably free of entries (safe to release), 0 otherwise. */
-static int
-mempreleasesafe(struct membuf *buf, size_t stride)
-{
-    size_t n;
-    size_t i;
-
-    if (!stride) {
-        return 1;
-    }
-    n = buf->size / stride;
-    if (!n) {
-        n = 1;
-    }
-    for (i = 0; i < n; i++) {
-        uintptr_t page = mempageadr(buf->adr + i * stride);
-        if (tabhashfind(g_memhashtab, page).page) {
-
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-static int
-membufowns(struct membuf *buf, uintptr_t page)
-{
-    if (!buf || !buf->adr || !buf->queue) {
-
-        return 0;
-    }
-    if (page < (uintptr_t)buf->adr
-        || page >= (uintptr_t)buf->adr + buf->size) {
-
-        return 0;
-    }
-
-    return 1;
-}
-
-/* release allocation block */
-static void
-memputblk(struct membuf *buf, void *ptr)
-{
-    struct membufq     *queue = buf->queue;
-    unsigned long       qid = queue->qid;
-    struct memtls      *tls = queue->tls;
-    long                lim = (tls) ? memnblktlsbuf(qid) : memnblkbuf(qid);
-    struct membufq     *glob;
-    void               *adr;
-    long                ndx;
-    long                max;
-    long                nbuf;
-
-    if (!tls) {
-        mtlkfmtx(&queue->mtx);
-    }
-    adr = memgetptr(ptr);
-    if (UNLIKELY(!adr)) {
-        /* undecodable (stale) entry - drop the free rather than push a
-         * NULL onto the allocation stack (GAP-FILL(vs)) */
-        if (!tls) {
-            mtunlkfmtx(&queue->mtx);
-        }
-
-        return;
-    }
-    ndx = buf->ofs;
-    max = buf->max;
-    ndx--;
-    nbuf = queue->nbuf;
-    max--;
-    buf->tab[ndx] = (uintptr_t)adr;
-    buf->ofs = ndx;
-    /* GAP-FILL(vs): with buffers permanently linked there is nothing to
-     * requeue - the old tail-reinsert double-linked live buffers */
-    if (!ndx && nbuf > lim) {
-        if (queue->nusable > 0) {
-            queue->nusable--;   /* usable buffer leaves the queue */
-        }
-        memdequebuf(queue, buf);
-        if (!tls) {
-            mempurgebufentries(buf, PAGESIZE);
-            memfreebuf(buf);           /* GAP-FILL(vs): unmap before the */
-            buf->prev = buf;  /* GAP-FILL(vs): kill stale links */
-            buf->next = buf;
-            memputbuf(buf, MEM_BLK);   /* GAP-FILL(vs): header goes home */
-        } else {
-            glob = &g_mem.blktab[qid];
-            /* MT: global queue mutations take the global queue lock */
-            mtlkfmtx(&glob->mtx);
-            nbuf = glob->nbuf;
-            lim = memnblkbuf(qid);
-            if (nbuf > lim) {
-                mempurgebufentries(buf, PAGESIZE);
-                memfreebuf(buf);           /* GAP-FILL(vs): unmap before the */
-                buf->prev = buf;  /* GAP-FILL(vs): kill stale links */
-                buf->next = buf;
-                memputbuf(buf, MEM_BLK);   /* GAP-FILL(vs): header goes home */
-            } else {
-                buf->queue = glob;   /* MT: rebind on handoff - frees
-                                      * must route to the queue that
-                                      * now owns the buffer */
-                mempushbuf(glob, buf);
-                glob->nusable++;    /* empty/all-free buffer is usable */
-            }
-            mtunlkfmtx(&glob->mtx);
-        }
-    }
-    if (!tls) {
-        mtunlkfmtx(&queue->mtx);
-    }
-
-    return;
-}
-
-/* release allocation run */
 static struct membuf *
-memputrun(struct membuf *buf, void *adr)
+memnewbuf(unsigned long qid, long type)
 {
-    struct membufq     *queue = buf->queue;
-    unsigned long       qid = queue->qid;
-    struct memtls      *tls = queue->tls;
-    long                ndx = memrunnum(qid, buf, adr);
-    uintptr_t           bits = buf->bits;
-    uintptr_t           mask = (uintptr_t)1 << ndx;
-    long                nrun = buf->max;
-    long                nbuf = queue->nbuf;
-    long                lim = 2;
-    struct membufq     *glob;
-
-    if (!tls) {
-        mtlkfmtx(&queue->mtx);
+    size_t size = type == MEM_BLK ? memblkslabsize(qid) : memrunslabsize(qid);
+    struct membuf *buf = memgetbuf(type);
+    if (!buf) {
+        return NULL;
     }
-    /* GAP-FILL(vs): duplicate free of a run is tolerated (bit already
-     * set) exactly as upstream did */
-    bits |= mask;
-    buf->bits = bits;
-    /* GAP-FILL(vs): requeue only buffers actually unlinked - marked by
-     * self-links where the allocator popped them at exhaustion. A
-     * partially-allocated buffer is still on its queue; requeueing it
-     * would double-link it. */
-    if (bits == mask && buf->next == buf && buf->prev == buf) {
-        memqueuebuf(queue, buf);
-    } else if (bits != mask) {
-        mask = (uintptr_t)1 << nrun;
-        mask--;
-        if (bits == mask && nbuf > lim) {
-            if (queue->nusable > 0) {
-                queue->nusable--;   /* usable buffer leaves the queue */
-            }
-            memdequebuf(queue, buf);
-            if (!tls) {
-                if (UNLIKELY(buf->bits != (((uintptr_t)1 << buf->max) - 1))) {
-                }
-                if (!mempreleasesafe(buf, PAGESIZE * qid)) {
-                    if (!tls) { mtunlkfmtx(&queue->mtx); }
-                    return buf;
-                }
-                mempurgebufentries(buf, PAGESIZE * qid);
-                memfreebuf(buf);           /* GAP-FILL(vs): unmap before the */
-                buf->prev = buf;  /* GAP-FILL(vs): kill stale links */
-                buf->next = buf;
-                memputbuf(buf, MEM_RUN);   /* GAP-FILL(vs): header goes home */
-            } else {
-                glob = &g_mem.runtab[qid];
-                /* MT: global queue mutations take the global queue lock */
-                mtlkfmtx(&glob->mtx);
-                nbuf = glob->nbuf;
-                mask = (uintptr_t)1 << nrun;
-                lim = memnrunbuf(qid);
-                mask--;
-                if (bits == mask && nbuf > lim) {
-                    mempurgebufentries(buf, PAGESIZE * qid);
-                    memfreebuf(buf);       /* GAP-FILL(vs): unmap before the */
-                    buf->prev = buf;  /* GAP-FILL(vs): kill stale links */
-                    buf->next = buf;
-                    memputbuf(buf, MEM_RUN);   /* GAP-FILL(vs): header home */
-                } else {
-                    buf->queue = glob;   /* MT: rebind on handoff */
-                    mempushbuf(glob, buf);
-                    glob->nusable++;    /* empty/all-free buffer is usable */
-                }
-                mtunlkfmtx(&glob->mtx);
+    buf->adr = mapanon(-1, size, 0);
+    if (buf->adr == MAP_FAILED) {
+        memputbuf(buf, type);
+        return NULL;
+    }
+    buf->size = size;
+    buf->ofs = 0;
+    if (type == MEM_BLK) {
+        buf->max = memnblk(qid);
+        for (size_t i = 0; i < buf->max; ++i) {
+            buf->tab[i] = (uintptr_t)buf->adr + i * memblksize(qid);
+        }
+    } else {
+        buf->max = memnrun(qid);
+        buf->bits = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
+    }
+    return buf;
+}
+
+static void *
+memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
+{
+    struct membufq *queue = type == MEM_BLK
+        ? &t_memtls->blktab[qid] : &t_memtls->runtab[qid];
+    struct membuf *buf = queue->head;
+    int8_t *ptr;
+    size_t size = type == MEM_BLK ? memblksize(qid) : memrunsize(qid);
+    if (!buf) {
+        struct membufq *glob = type == MEM_BLK
+            ? &g_mem.blktab[qid] : &g_mem.runtab[qid];
+        mtlkfmtx(&glob->mtx);
+        buf = glob->head;
+        if (buf) {
+            /* Only empty buffers enter the global reserve. Transfer the
+             * whole buffer once, then serve it locally. */
+            memdequebuf(glob, buf);
+            glob->nbuf--;
+        }
+        mtunlkfmtx(&glob->mtx);
+        if (!buf) {
+            buf = memnewbuf(qid, type);
+            if (!buf) {
+                return NULL;
             }
         }
+        buf->queue = queue;
+        queue->nbuf++;
+        memqueuebuf(queue, buf);
     }
-    if (!tls) {
-        mtunlkfmtx(&queue->mtx);
+    if (type == MEM_BLK) {
+        ptr = (int8_t *)buf->tab[buf->ofs++];
+        if (buf->ofs == buf->max) {
+            memdequebuf(queue, buf);
+        }
+    } else {
+        unsigned long index = m_ctz(buf->bits);
+        ptr = buf->adr + index * size;
+        buf->bits &= buf->bits - 1;
+        if (!buf->bits) {
+            memdequebuf(queue, buf);
+        }
     }
+    /* Ordinary blocks/runs already satisfy the minimum alignment. */
+    if (align > (type == MEM_BLK ? CLSIZE : PAGESIZE)) {
+        int8_t *aligned = memalignptr(ptr, align);
+        if (retsize) {
+            *retsize = size - (aligned - ptr);
+        }
+        ptr = aligned;
+    } else if (retsize) {
+        *retsize = size;
+    }
+    tabhashaddref(g_memhashtab, mempageadr(ptr), memsethashbuf(buf, qid, type));
+    return ptr;
+}
 
-    return buf;
+/* An empty buffer is either retained, transferred to the global reserve,
+ * or unmapped. All its page references have already been released. */
+static void
+memreleaseempty(struct membuf *buf, long type)
+{
+    struct membufq *queue = buf->queue;
+    unsigned long qid = queue->qid;
+    long limit = type == MEM_BLK ? memnblktlsbuf(qid) : memnruntlsbuf(qid);
+    if (queue->nbuf <= limit) {
+        return;
+    }
+    memdequebuf(queue, buf);
+    queue->nbuf--;
+    struct membufq *glob = type == MEM_BLK
+        ? &g_mem.blktab[qid] : &g_mem.runtab[qid];
+    limit = type == MEM_BLK ? memnblkbuf(qid) : memnrunbuf(qid);
+    mtlkfmtx(&glob->mtx);
+    if (glob->nbuf < limit) {
+        buf->queue = glob;
+        glob->nbuf++;
+        memqueuebuf(glob, buf);
+        mtunlkfmtx(&glob->mtx);
+    } else {
+        mtunlkfmtx(&glob->mtx);
+        memfreebuf(buf);
+        memputbuf(buf, type);
+    }
 }
 
 /* acquire big allocation */
@@ -1109,7 +353,6 @@ memgetbig(size_t size, size_t align, size_t *retsize)
     int8_t             *ptr;
     int8_t             *ret = NULL;
     size_t              aln;
-    size_t              cnt;
     uintptr_t           page;
     uintptr_t           val;
 
@@ -1119,12 +362,15 @@ memgetbig(size_t size, size_t align, size_t *retsize)
     } else {
         ret = memalignptr(ptr, align);
         aln = ret - ptr;
+        /* An over-aligned BIG mapping has a page-sized prefix. Drop it
+         * now so the returned pointer is also the mapping's base. */
+        if (aln) {
+            unmapanon(ptr, aln);
+            mapsz -= aln;
+        }
         page = memsethashpage(mempageadr(ret), MEM_BIG);
-        /* GAP-FILL(vs): aln is 0 for page-aligned mappings; ctz(0) is UB */
-        cnt = aln ? m_ctz(aln) : 0;
-        val = memsethashval(mapsz, cnt) | (MEM_BIG << MEM_BUF_QUEUE_BITS);
+        val = mapsz | (MEM_BIG << MEM_BUF_QUEUE_BITS);
         tabhashadd(g_memhashtab, page, val);
-        mapsz -= aln;
         if (retsize) {
             *retsize = mapsz;
         }
@@ -1133,55 +379,41 @@ memgetbig(size_t size, size_t align, size_t *retsize)
     return ret;
 }
 
-/* free (unmap) big allocation */
-static void
-memfreebig(void *ptr, size_t size)
-{
-    tabhashdel(g_memhashtab, (uintptr_t)ptr);
-    unmapanon(ptr, size);
+/* Allocate from the size class directly; only explicit callers request
+ * usable capacity. malloc's ordinary path does not need to calculate it. */
+static void memdeferdrain(struct memtls *tls);
 
-    return;
-}
-
-/* allocate size bytes, align to boundary of align bytes */
 void *
 memget(size_t size, size_t align, size_t *retsize)
 {
-    void               *ptr = NULL;
-    size_t              aln = max(align, MEM_ALIGN_MIN);
-    size_t              alnsz = memalnsize(size, aln);
-    uintptr_t           type = membuftype(alnsz);
-    size_t              blksz = 0;
-    unsigned long       qid;
+    /* owning thread activity: drain remote frees in passing (two
+     * compares when empty; allocators that never free must still drain) */
+    if (t_memtls && UNLIKELY(t_memtls->defertail != t_memtls->deferhead)) {
+        memdeferdrain(t_memtls);
+    }
 
+    size_t aln = max(align, MEM_ALIGN_MIN);
+    size_t alnsz = memalnsize(size, aln);
+    unsigned long qid;
+    if (!size) {
+        return NULL;
+    }
+    if (alnsz > SIZE_MAX - (PAGESIZE - 1)) {
+        errno = ENOMEM;
+        return NULL;
+    }
     if (!(g_mem.flg & MEM_INIT_BIT)) {
         meminit(&g_mem);
     }
-    switch (type) {
-        case MEM_BLK:
-            blksz = roundup2(alnsz, MEM_BLK_MIN);
-            qid = memblkqid(blksz);
-            ptr = memgetblk(qid, aln, &blksz);
-
-            break;
-        case MEM_RUN:
-            blksz = roundup2(alnsz, PAGESIZE);
-            qid = memrunqid(blksz);
-            ptr = memgetrun(qid, aln, &blksz);
-
-            break;
-        case MEM_BIG:
-            blksz = roundup2(alnsz, PAGESIZE);
-            ptr = memgetbig(blksz, aln, &blksz);
-        default:
-
-            break;
+    qid = memblkqid(alnsz);
+    if (qid < MEM_BLK_QUEUES) {
+        return memgetsmall(qid, MEM_BLK, aln, retsize);
     }
-    if ((ptr) && (retsize)) {
-        *retsize = blksz;
+    qid = memrunqid(alnsz);
+    if (qid < MEM_RUN_QUEUES) {
+        return memgetsmall(qid, MEM_RUN, aln, retsize);
     }
-
-    return ptr;
+    return memgetbig(alnsz, aln, retsize);
 }
 
 #define memsize(ptr) 0 /* FIXME */
@@ -1225,215 +457,139 @@ memresize(void *ptr, size_t size, size_t align, long flg)
     return adr;
 }
 
-/* MT: release workers called with the owning queue lock already held
- * (queue -> slot is the global lock order; the reverse never occurs).
- * The block address is decoded from the buffer's delta table directly -
- * no second hash lookup (a re-find between find and queue-lock was the
- * window where another thread could recycle the header). */
-static void
-memputblk_locked(struct membuf *buf, void *ptr, unsigned long qid)
-{
-    struct membufq     *queue = buf->queue;
-    struct memtls      *tls = queue->tls;
-    long                lim = (tls) ? memnblktlsbuf(qid) : memnblkbuf(qid);
-    struct membufq     *glob;
-    void               *adr;
-    long                ndx;
-    long                max;
-    long                nbuf;
-    long                slot;
-
-    slot = buf->max + memblknum(qid, buf, ptr);
-    adr = (void *)((uintptr_t)ptr - buf->tab[slot]);
-    buf->tab[slot] = 0;           /* delta consumed */
-    ndx = buf->ofs - 1;
-    max = buf->max - 1;
-    nbuf = queue->nbuf;
-    buf->tab[ndx] = (uintptr_t)adr;   /* block returns to the free-stack */
-    if (ndx == buf->max - 1) {
-        queue->nusable++;      /* exhausted buffer has room again */
-        if (tls && !(buf->availf)) {
-            buf->availf = 1;
-            buf->anext = ((struct memtls *)tls)->availblk[qid];
-            ((struct memtls *)tls)->availblk[qid] = buf;
-        }
-    }
-    buf->ofs = ndx;
-    if (!ndx && nbuf > lim) {
-        if (queue->nusable > 0) {
-            queue->nusable--;   /* usable buffer leaves the queue */
-        }
-        memdequebuf(queue, buf);
-        if (!tls) {
-            mempurgebufentries(buf, PAGESIZE);
-            memfreebuf(buf);
-            buf->prev = buf;
-            buf->next = buf;
-            memputbuf(buf, MEM_BLK);
-        } else {
-            glob = &g_mem.blktab[qid];
-            mtlkfmtx(&glob->mtx);
-            if (glob->nbuf > memnblkbuf(qid)) {
-                mempurgebufentries(buf, PAGESIZE);
-                memfreebuf(buf);
-                buf->prev = buf;
-                buf->next = buf;
-                memputbuf(buf, MEM_BLK);
-            } else {
-                buf->queue = glob;   /* MT: rebind on handoff - frees
-                                      * must route to the queue that
-                                      * now owns the buffer */
-                mempushbuf(glob, buf);
-                glob->nusable++;    /* empty/all-free buffer is usable */
-            }
-            mtunlkfmtx(&glob->mtx);
-        }
-    }
-
-    return;
-}
-
-static void
-memputrun_locked(struct membuf *buf, void *ptr, unsigned long qid)
-{
-    struct membufq     *queue = buf->queue;
-    struct memtls      *tls = queue->tls;
-    long                nrun = buf->max;
-    long                nbuf = queue->nbuf;
-    long                lim = 2;
-    long                ndx = memrunnum(qid, buf, ptr);
-    uintptr_t           bits = buf->bits;
-    uintptr_t           mask = (uintptr_t)1 << ndx;
-    struct membufq     *glob;
-
-    if (!bits) {
-        queue->nusable++;      /* exhausted buffer has a free run again */
-        if (tls && !(buf->availf)) {
-            buf->availf = 1;   /* set BEFORE bits |= mask */
-            buf->anext = ((struct memtls *)tls)->availrun[qid];
-            ((struct memtls *)tls)->availrun[qid] = buf;
-        }
-    }
-    bits |= mask;
-    buf->bits = bits;
-    mask = ((uintptr_t)1 << nrun) - 1;
-    if (bits == mask && nbuf > lim) {
-        if (queue->nusable > 0) {
-            queue->nusable--;   /* usable buffer leaves the queue */
-        }
-        memdequebuf(queue, buf);
-        if (!tls) {
-            mempurgebufentries(buf, PAGESIZE * qid);
-            memfreebuf(buf);
-            buf->prev = buf;
-            buf->next = buf;
-            memputbuf(buf, MEM_RUN);
-        } else {
-            glob = &g_mem.runtab[qid];
-            mtlkfmtx(&glob->mtx);
-            if (glob->nbuf > memnrunbuf(qid)) {
-                mempurgebufentries(buf, PAGESIZE * qid);
-                memfreebuf(buf);
-                buf->prev = buf;
-                buf->next = buf;
-                memputbuf(buf, MEM_RUN);
-            } else {
-                buf->queue = glob;   /* MT: rebind on handoff - frees
-                                      * must route to the queue that
-                                      * now owns the buffer */
-                mempushbuf(glob, buf);
-                glob->nusable++;    /* empty/all-free buffer is usable */
-            }
-            mtunlkfmtx(&glob->mtx);
-        }
-    }
-
-    return;
-}
-
-/* GAP-FILL(vs): entries are fungible per base page, so a page can carry
- * entries of several eras (and types) at once. A stale BIG entry sharing
- * a page with live BLK/RUN entries used to win the lookup and mass-unmap
- * everything above it. Release is now type-aware and validating: pull
- * entries for the page one at a time, drop stale ones, and honour a BIG
- * unmap only once the page provably holds nothing else. */
+/* Kept for the existing stress harness's diagnostic ABI. */
 static struct bigunmap { uintptr_t page; size_t size; } g_bigu[256];
 static unsigned g_bigui;
-struct bigunmap *g_bigu_pub = (struct bigunmap *)g_bigu;
+struct bigunmap *g_bigu_pub = g_bigu;
 unsigned *g_bigui_pub = &g_bigui;
+
+/* remote-free: apply a deferred free on the owning thread */
+static void
+memdeferapply(struct memtls *tls, struct membuf *buf, void *ptr, long type)
+{
+    struct membufq *queue = buf->queue;
+    unsigned long   qid = queue->qid;
+
+    if (type == MEM_BLK) {
+        size_t index = memblknum(qid, buf, ptr);
+        if (buf->ofs == buf->max) {
+            memqueuebuf(queue, buf);
+        }
+        buf->tab[--buf->ofs] = (uintptr_t)buf->adr + index * memblksize(qid);
+        if (!buf->ofs) {
+            memreleaseempty(buf, type);
+        }
+    } else {
+        size_t index = memrunnum(qid, buf, ptr);
+        if (!buf->bits) {
+            memqueuebuf(queue, buf);
+        }
+        buf->bits |= (uintptr_t)1 << index;
+        if (buf->bits == (UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max))) {
+            memreleaseempty(buf, type);
+        }
+    }
+}
+
+static void
+memdeferdrain(struct memtls *tls)
+{
+    if (tls->defertail == tls->deferhead) {
+
+        return;
+    }
+    while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
+        m_waitspin();
+    }
+    while (tls->defertail != tls->deferhead) {
+        struct memdefer *d = &tls->defer[tls->defertail % MEM_DEFER_N];
+
+        if (d->buf && d->buf->queue) {
+            memdeferapply(tls, d->buf, d->ptr, d->type);
+        }
+        tls->defertail++;
+    }
+    __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+
+    return;
+}
+
+/* MPSC push, spinlocked: the remote-free path is the slow path - an
+ * obviously-correct lock beats a clever lock-free ring. A full ring
+ * waits for the owner to drain (the owner never blocks on producers). */
+static void
+memdeferpush(struct memtls *tls, struct membuf *buf, void *ptr, long type)
+{
+    while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
+        m_waitspin();
+    }
+    long spins = 0;
+    while (tls->deferhead - tls->defertail >= MEM_DEFER_N) {
+        if (++spins > (1L << 20)
+            && !__atomic_load_n(&tls->alive, __ATOMIC_ACQUIRE)) {
+            /* owner exited: nobody will drain - apply directly under the
+             * ring lock (serialised against other dead-owner applies) */
+            memdeferapply(tls, buf, ptr, type);
+            __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+
+            return;
+        }
+        __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+        m_waitspin();
+        while (__atomic_test_and_set(&tls->deferlk, __ATOMIC_ACQUIRE)) {
+            m_waitspin();
+        }
+    }
+    {
+        struct memdefer *d = &tls->defer[tls->deferhead % MEM_DEFER_N];
+
+        d->buf = buf;
+        d->ptr = ptr;
+        d->type = type;
+        tls->deferhead++;
+    }
+    __atomic_clear(&tls->deferlk, __ATOMIC_RELEASE);
+
+    return;
+}
+
 void
 memput(void *ptr)
 {
-    uintptr_t           page = mempageadr(ptr);
-
-    if (!(g_mem.flg & MEM_INIT_BIT)) {
-        abort();
+    uintptr_t page = mempageadr(ptr);
+    struct memhash hash = tabhashrm(g_memhashtab, page);
+    if (!hash.page) {
+        return;
     }
-    {
-        struct memhash hash = tabhashfind(g_memhashtab, page);
-        long           type;
-        struct membuf  *buf;
-        struct membufq *queue;
-
-        if (!hash.page) {
-
-            return;
-        }
-        type = memhashtype(&hash);
-        buf = (struct membuf *)memhashbuf(&hash);
-
-        if (type == MEM_BIG) {
-            size_t size = (size_t)(hash.val & ~(uintptr_t)0xFFF);
-
-            if (size >= MEM_RUN_MAX && !memrangebusy(page, size)) {
-                unmapanon((void *)page, size);
-            }
-            tabhashrm(g_memhashtab, page);
-
-            return;
-        }
-        if ((uintptr_t)buf < (uintptr_t)0x10000
-            || !buf->adr || !buf->queue
-            || (uintptr_t)ptr < (uintptr_t)buf->adr
-            || (uintptr_t)ptr
-               >= (uintptr_t)buf->adr + buf->size) {
-            /* raced or stale: NEVER remove the entry on a failed
-             * validation - it belongs to whichever free validates it */
-            return;
-        }
-        queue = buf->queue;
-        if (!queue->tls) {
-            mtlkfmtx(&queue->mtx);
-        }
-        if (UNLIKELY(!buf->adr || buf->queue != queue
-                     || (uintptr_t)ptr < (uintptr_t)buf->adr
-                     || (uintptr_t)ptr
-                        >= (uintptr_t)buf->adr + buf->size)) {
-            if (!queue->tls) {
-                mtunlkfmtx(&queue->mtx);
-            }
-
-            return;
-        }
-        if (type == MEM_BLK) {
-            memputblk_locked(buf, ptr, queue->qid);
-            if (queue->tls
-                && !((struct memtls *)queue->tls)->curblk[queue->qid]
-                && buf->ofs < buf->max && buf->queue == queue) {
-                ((struct memtls *)queue->tls)->curblk[queue->qid] = buf;
-            }
-        } else {
-            memputrun_locked(buf, ptr, queue->qid);
-            if (queue->tls
-                && !((struct memtls *)queue->tls)->currun[queue->qid]
-                && buf->bits && buf->queue == queue) {
-                ((struct memtls *)queue->tls)->currun[queue->qid] = buf;
-            }
-        }
-        tabhashrm(g_memhashtab, page);   /* slot under queue: lock order */
-        if (!queue->tls) {
-            mtunlkfmtx(&queue->mtx);
-        }
+    long type = memhashtype(&hash);
+    if (type == MEM_BIG) {
+        size_t size = (size_t)(hash.val & ~(uintptr_t)(PAGESIZE - 1));
+        unmapanon((void *)page, size);
+        return;
     }
+    struct membuf *buf = memhashbuf(&hash);
+    struct membufq *queue = buf->queue;
+    /* Removal returned the packed owner. Decode it directly, before a
+     * last free can release the slab; no second hash lookup is needed. */
+    if (queue->tls && queue->tls != (struct memtls *)t_memtls) {
+        /* remote free: the buffer belongs to another thread's domain -
+         * defer; the owner applies it (cross-thread mutation of its
+         * buffers is unsynchronised otherwise) */
+        memdeferpush(queue->tls, buf, ptr, type);
+
+        return;
+    }
+    if (!queue->tls) {
+        /* global-reserve buffer: mutate under the queue lock (mirrors
+         * the allocation path) */
+        mtlkfmtx(&queue->mtx);
+        memdeferapply(t_memtls, buf, ptr, type);
+        mtunlkfmtx(&queue->mtx);
+
+        return;
+    }
+    memdeferapply(t_memtls, buf, ptr, type);
+    /* own domain: drain remote frees in passing (bounded, cheap when
+     * empty) */
+    memdeferdrain(t_memtls);
 }
-

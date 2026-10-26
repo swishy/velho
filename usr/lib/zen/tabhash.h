@@ -59,7 +59,7 @@ tabhashputtab(TABHASH_TAB_T *tab)
     }
     tab->next = head;
     tab->prev = NULL;   /* GAP-FILL(vs): BUF-resident prev is meaningless */
-    mtunlkval((m_atomic_t *)&TABHASH_BUF, (m_atomic_t)head);
+    mtunlkval((m_atomic_t *)&TABHASH_BUF, (m_atomic_t)tab);
 
     return;
 }
@@ -210,7 +210,7 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
     tab = (void *)((uintptr_t)head & ~MEM_LK_BIT);
     head = tab;
     while (tab) {
-        lim = tab->nmax;
+        lim = tab->ncur;
         item = &tab->items[0];
         for (cur = 0 ; cur < lim ; cur++) {
             if (!TABHASH_CMP(item, val)) {
@@ -265,6 +265,7 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
                          * is what belongs here. */
                         tab->next = head;
                         tab->prev = NULL;  /* GAP-FILL(vs): new chain head */
+                        head->prev = tab;
                     }
                     head = tab;
                 }
@@ -285,7 +286,7 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
 static __inline__ long
 tabhashaddref(TABHASH_TAB_T **hashtab, const uintptr_t key, const uintptr_t val)
 {
-    TABHASH_ITEM_T      item = tabhashop(hashtab, val, TABHASH_ADD_REF);
+    TABHASH_ITEM_T      item = tabhashop(hashtab, key, TABHASH_ADD_REF);
     long                retval = 0;
 
     if (!TABHASH_CHK(&item)) {

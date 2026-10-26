@@ -20,9 +20,9 @@
 #include <mach/ppc/asm.h>
 #endif
 
-/* GAP-FILL(vs): the guard tested the POINTER value, not the lock word,
- * and the bit ops were hand-rolled asm the optimiser was free to cache
- * at -O1+ (eternal spin on an already-locked word). Atomic builtins. */
+/* GAP-FILL(vs): the upstream macro's guard tested the POINTER, not the
+ * lock word, and its cmpsetbit result was undefined on the acquired
+ * path (see mt/lk.h). Honest acquire with the repaired primitive. */
 #define m_trylkbit(p, ndx)                                              \
     (!(__atomic_fetch_or((m_atomic_t *)(p), (m_atomic_t)1 << (ndx),     \
                          __ATOMIC_ACQ_REL) & ((m_atomic_t)1 << (ndx))))
@@ -34,14 +34,13 @@
         m_atomic_t _bit = (m_atomic_t)1 << (ndx);                       \
         m_atomic_t _old;                                                \
                                                                         \
-        /* GAP-FILL(vs): the engine re-enters these locks on the same word
-         * within one thread (the original primitive never actually tested
-         * the word, so re-entrancy silently worked). Single-threaded
-         * semantics: RMW-acquire without self-spinning; a set bit is
-         * always our own hold. (Multi-threaded use needs the recursion
-         * untangled first - see FINDINGS.) */ \
-        _old = __atomic_fetch_or((m_atomic_t *)(p), _bit,               \
-                                 __ATOMIC_ACQ_REL);                     \
+        do {                                                            \
+            while (__atomic_load_n((volatile m_atomic_t *)(p),          \
+                                   __ATOMIC_ACQUIRE) & _bit) {          \
+                m_waitspin();                                           \
+            }                                                           \
+            _old = m_cmpsetbit((p), (ndx));                             \
+        } while (_old & _bit);                                          \
     } while (0)
 
 #endif /* __MACH_ASM_H__ */

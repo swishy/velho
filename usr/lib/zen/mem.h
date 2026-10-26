@@ -104,16 +104,13 @@
                                  >> (PAGESIZELOG2 + MEM_BIG_SHIFT))
 #define membigsize(qid)         (MEM_BIG_UNIT * (qid))
 #define memnblk(qid)            (g_mem.nblktab[(qid)])
-/* GAP-FILL(vs): the 1/blksz double strength-reduction truncates e.g.
- * 12.9999... to 12 for some size classes, mis-decoding block indices;
- * round to nearest instead */
+/* An aligned pointer remains inside its fixed-size block/run. Recover
+ * the index by flooring the offset; no per-allocation delta is needed. */
 #define memblknum(qid, buf, ptr)                                        \
-    ((long)(((uintptr_t)(ptr) - (uintptr_t)((buf)->adr))                \
-            * g_mem.blkdivtab[(qid)] + 0.5))
+    (((uintptr_t)(ptr) - (uintptr_t)((buf)->adr)) / memblksize(qid))
 #define memnrun(qid)            (g_mem.nruntab[(qid)])
 #define memrunnum(qid, buf, ptr)                                        \
-    ((long)(((uintptr_t)(ptr) - (uintptr_t)((buf)->adr))                \
-            * g_mem.rundivtab[(qid)] + 0.5))   /* GAP-FILL(vs): see memblknum */
+    (((uintptr_t)(ptr) - (uintptr_t)((buf)->adr)) / memrunsize(qid))
 #define memnblktlsbuf(qid)                                              \
     (((qid) <= MEM_BLK_MID_QUEUE_MIN)                                   \
      ? 4                                                                \
@@ -142,7 +139,7 @@
  /* must be power of two size/alignment at least a page */
 #define membufsize()            PAGESIZE
 #define memblkbufsize()                                                 \
-    roundup2(membufsize() + 2 * MEM_BLK_MAX_BLOCKS * sizeof(uintptr_t), \
+    roundup2(sizeof(struct membuf) + MEM_BLK_MAX_BLOCKS * sizeof(uintptr_t), \
              PAGESIZE)
 #define memrunbufsize()         (membufsize())
 #define membigbufsize()         (membufsize())
@@ -164,9 +161,6 @@ struct membuf {
     struct membufq     *queue;  // queue the buffer is on
     struct membuf      *prev;   // previous magazine in queue
     struct membuf      *next;   // next magazine in queue
-    struct membuf      *anext;  // available-stack link (per-TLS LIFO)
-    unsigned char       availf; // on the avail-stack (bits is live data)
-    unsigned char       pad7[7];
     uintptr_t           tab[VLA];
 };
 
@@ -177,25 +171,30 @@ struct membufq {
     struct memtls      *tls;    // pointer to thread-local data
     struct membuf      *head;   // queue head
     struct membuf      *tail;   // queue tail
-    long                nusable; // buffers with room (walk guard)
-    long                pad;    // pad to multiple of 8 machine words
+    long                pad[2]; // one cache line per queue
 };
 
 struct memtls {
     struct membufq      blktab[MEM_BLK_QUEUES];
     struct membufq      runtab[MEM_RUN_QUEUES];
-    /* MT/perf: per-class current-buffer cursors - the O(1) magazine fast
-     * path. Walking the queues at volume is O(live buffers) per
-     * allocation (the quadratic); the cursor makes the common case a
-     * single dereference. */
-    struct membuf      *curblk[MEM_BLK_QUEUES];
-    struct membuf      *currun[MEM_RUN_QUEUES];
-    /* magazine available-stacks: LIFO of probably-usable buffers; pops
-     * validate and skip stale entries (the queue walk was O(live) and
-     * the volume quadratic) */
-    struct membuf      *availblk[MEM_BLK_QUEUES];
-    struct membuf      *availrun[MEM_RUN_QUEUES];
+    /* remote-free ring: cross-thread frees are deferred here (MPSC) and
+     * applied by the owning thread on its next allocator activity. The
+     * freeing thread has already consumed the page-hash entry, so the
+     * handoff carries the decoded (buffer, pointer, type) tuple. */
+#define MEM_DEFER_N 4096
+    struct memdefer {
+        struct membuf  *buf;
+        void           *ptr;
+        long            type;
+    }                   defer[MEM_DEFER_N];
+    volatile m_atomic_t deferlk;     /* ring spinlock */
+    volatile m_atomic_t alive;       /* owner thread still running */
+    m_atomic_t          deferhead;   /* producer index (under lock) */
+    m_atomic_t          defertail;   /* owner index (under lock) */
 };
+
+/* engine-internal */
+extern THREADLOCAL struct memtls *t_memtls;
 
 /* flg-member */
 #define MEM_INIT_BIT            ((m_atomic_t)(1 << 0))
@@ -203,10 +202,8 @@ struct memglob {
     /* allocation queue tables */
     struct membufq              blktab[MEM_BLK_QUEUES];
     long                        nblktab[MEM_BLK_QUEUES];
-    double                      blkdivtab[MEM_BLK_QUEUES];
     struct membufq              runtab[MEM_RUN_QUEUES];
     long                        nruntab[MEM_RUN_QUEUES];
-    double                      rundivtab[MEM_RUN_QUEUES];
     volatile struct membuf     *blkhdrq;
     volatile struct membuf     *bufhdrq;
     volatile struct tabhashtab *hashtabq;
@@ -234,76 +231,13 @@ void  * memget(size_t size, size_t align, size_t *retsize);
 void    memput(void *ptr);
 void  * memresize(void *ptr, size_t size, size_t align, long flg);
 
-/*
- * hash-item (struct memhash) contents
- * ------------------
- *
- * struct memhash consists of two machine words as described below
- *
- * struct memhash {
- *     uintptr_t page;
- *     uintptr_t val;
- * };
- *
- * here we list the contents of struct memhash for different allocation classes
- * in little-endian (least-significant byte first) bit/byte-order
- *
- * blk-class
- * ---------
- *
- * nref - number of active allocations in page
- * type - allocation type (MEM_TYPE_BLK)
- * adr  - allocation page-address
- * qid  - blk-queue ID
- * tls  - thread-local storage flag
- * buf  - header (struct membuf) address
- *
- * struct memhash {
- *     unsigned nref    : PAGESIZELOG2 - MEM_TYPE_BITS;
- *     unsigned type    : MEM_TYPE_BITS;
- *     unsigned adr     : MEM_PAGE_PTR_BITS;
- *     unsigned qid     : MEM_BUF_QUEUE_BITS;
- *     unsigned tls     : 1;
- *     unsigned buf     : MEM_PAGE_PTR_BITS;
- * };
- *
- * run-class
- * ---------
- *
- * res  - reserved bits
- * type - allocation type (MEM_TYPE_RUN)
- * adr  - allocation [page] address
- * qid  - run-queue ID
- * tls  - thread-local storage flag
- * size - allocation size
- *
- * struct memhash {
- *     unsigned res     : PAGESIZELOG2 - MEM_TYPE_BITS;
- *     unsigned type    : MEM_TYPE_BITS;
- *     unsigned adr     : MEM_PAGE_PTR_BITS;
- *     unsigned qid     : MEM_BUF_QUEUE_BITS
- *     unsigned tls     : 1;
- *     unsigned buf     : MEM_PAGE_PTR_BITS
- * };
- *
- * big-class
- * ---------
- *
- * res  - reserved bits
- * type - allocation type (MEM_TYPE_RUN)
- * adr  - allocation [page] address
- * aln  - alignment shift count
- * tls  - thread-local storage flag
- * size - allocation size
- *
- * struct memhash {
- *     unsigned res     : PAGESIZELOG2 - MEM_TYPE_BITS;
- *     unsigned type    : MEM_TYPE_BITS;
- *     unsigned adr     : MEM_PAGE_PTR_BITS;
- *     unsigned aln     : MEM_BIG_ALN_BITS;
- *     unsigned tls     : 1;
- *     unsigned size    : MEM_BIG_SIZE_BITS;
- * };
+/* Two-word page metadata:
+ *   page = allocation's starting page | active reference count (low bits).
+ *   val  = BLK/RUN header pointer | qid (low 8 bits) | type (next 2 bits),
+ *          or BIG mapping length | type. Header pointers and mapping
+ *          lengths are page-aligned, leaving the tag bits available.
+ * The hash key is always the untagged page address. BIG allocations trim
+ * any alignment prefix, so this page is also the address to unmap.
  */
 /* page-member */
 #define MEM_HASH_NREF_BITS              (PAGESIZELOG2 - MEM_TYPE_BITS)
@@ -371,31 +305,13 @@ extern struct memglob            g_mem ALIGNED(PAGESIZE);
 static __inline__ size_t
 memalnsize(size_t size, size_t align)
 {
-    if (align <= CLSIZE) {
-
+    if (align <= CLSIZE || (size >= MEM_BLK_MAX && align <= PAGESIZE)) {
         return size;
-    } else {
-        size_t blksize = size;
-        size_t alnsize = size;
-
-        blksize--;
-        alnsize--;
-        blksize -= CLSIZE;                      // size - 1 - CLSIZE
-        alnsize += align;                       // size - 1 + align
-        if (blksize < MEM_BLK_MAX) {
-
-            return blksize;
-        } else if (align <= PAGESIZE) {
-
-            return size;
-        } else {
-
-            return alnsize;
-        }
     }
-
-    /* NOTREACHED */
-    return 0;
+    /* Slab blocks already have cache-line alignment. Reserve only the
+     * maximum additional displacement, keeping the pointer in its block. */
+    return size > SIZE_MAX - (align - CLSIZE)
+        ? SIZE_MAX : size + align - CLSIZE;
 }
 
 static __inline__ void *
@@ -406,7 +322,6 @@ memgetptr(void *ptr)
     struct membuf      *buf = memhashbuf(&item);
     unsigned long       qid = memhashqid(&item);
     int8_t             *adr = ptr;
-    long                ofs;
     long                bits;
     long                mask;
     uintptr_t           num;
@@ -419,12 +334,8 @@ memgetptr(void *ptr)
     mtlkfmtx(&buf->queue->mtx);
     switch (type) {
         case MEM_BLK:
-            ofs = buf->max;
             num = memblknum(qid, buf, ptr);
-            ofs += num;
-            /* GAP-FILL(vs): tab[ofs] holds the alignment *delta* stored at
-             * allocation; the original block address is ptr - delta */
-            adr = (int8_t *)((uintptr_t)ptr - buf->tab[ofs]);
+            adr = buf->adr + num * memblksize(qid);
 
             break;
         case MEM_RUN:
@@ -432,7 +343,7 @@ memgetptr(void *ptr)
             num = memrunnum(qid, buf, ptr);
             bits = buf->bits;
             mask <<= num;
-            adr = (int8_t *)((uintptr_t)ptr - buf->tab[num]);
+            adr = buf->adr + num * memrunsize(qid);
             bits |= mask;
             buf->bits = bits;
 

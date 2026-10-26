@@ -1,27 +1,14 @@
-/* velho malloc(3) interposer - gap-filling layer for vendu's velho
- * (github.com/vendu/velho) usr/lib/zen allocator.
- *
- * The engine (zen/mem.c) is used as-is except for two marked GAP-FILL
- * edits in mem-fixed.c (runtab typo + claim-to-TLS on the global recycle
- * paths). This file fills the rest of what upstream never finished:
- *
- *   - vnd/ redirect headers (the vnd/ layer does not exist upstream);
- *   - thread-local store init: t_memtls is declared but never assigned
- *     anywhere in the tree, and membufq.qid/tls are never wired;
- *   - an actual size lookup for realloc and malloc_usable_size (upstream
- *     stubs memsize() out with a literal zero);
- *   - a malloc(3) API without the upstream shim's bugs (calloc
- *     allocated n*size but passed `size` to memget; realloc returned
- *     the OLD pointer).
- *
- * Sizes are decoded strictly through the engine's own packed-accessor
- * macros (memhashtype/memhashqid/memblksize/...) - never re-derived.
+/* malloc(3) interposer for vendu's zen allocator.
+ * The engine owns slabs, size-class queues and packed page metadata;
+ * this shim supplies process/TLS initialization and libc entry points.
+ * Usable capacity is decoded from the same metadata as the free path.
  */
 
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/types.h>
 
 #include <zero/cdefs.h>
@@ -41,7 +28,20 @@ void meminit(struct memglob *mem);
  * called from every API entry so pre-constructor allocations can never
  * observe unwired global queues (GAP-FILL(vs)) */
 static void shim_init(void);
+
+/* thread exit: mark this TLS domain dead - remote frees onto a full
+ * ring may then apply directly instead of waiting for a drain that will
+ * never come */
 static void
+thread_dtor(void *p)
+{
+    struct memtls *tls = p;
+
+    if (tls) {
+        __atomic_store_n(&tls->alive, 0, __ATOMIC_RELEASE);
+    }
+}
+
 shim_tls_init(void)
 {
     struct memtls *tls;
@@ -72,6 +72,19 @@ shim_tls_init(void)
                                          __ATOMIC_ACQ_REL,
                                          __ATOMIC_ACQUIRE)) {
             unmapanon(tls, sizeof(struct memtls));
+
+            return;
+        }
+        __atomic_store_n(&tls->alive, 1, __ATOMIC_RELEASE);
+        { static pthread_key_t dk;
+          if (!dk) {
+              if (pthread_key_create(&dk, thread_dtor)) {
+                  /* no TSS: treat as always-alive (rings drain at alloc) */
+              }
+          }
+          if (dk) {
+              pthread_setspecific(dk, tls);
+          }
         }
     }
 }
@@ -115,13 +128,7 @@ shim_memsize(void *ptr)
     long           type;
     size_t         sz = 0;
 
-    { int tries;
-      for (tries = 0; tries < 200000; tries++) {
-        item = tabhashfind(g_memhashtab, mempageadr(ptr));
-        if (item.page) break;
-        sched_yield();
-      }
-    }
+    item = tabhashfind(g_memhashtab, mempageadr(ptr));
     if (item.page) {
         type = memhashtype(&item);
         if (type == MEM_BLK) {
@@ -131,6 +138,10 @@ shim_memsize(void *ptr)
         } else if (type == MEM_BIG) {
             /* val = size | cnt | type-bits; size is a page multiple */
             sz = (size_t)(item.val & ~(uintptr_t)0xFFF);
+        }
+        if (type == MEM_BLK || type == MEM_RUN) {
+            struct membuf *buf = memhashbuf(&item);
+            sz -= ((uintptr_t)ptr - (uintptr_t)buf->adr) % sz;
         }
     }
 
