@@ -5,6 +5,9 @@ libc interposer in `usr/lib/c/malloc.c`. Read it before changing these paths.
 The dated review and benchmark reports record experiments; this document
 describes the maintained approach.
 
+[CI and release documentation](allocator-ci.md) describes the automated checks,
+commit-specific main releases and local test runner.
+
 The working mandate is concise pointer/bit arithmetic, little metadata and
 minimal work per allocation. This follows the project's reconstruction of
 Vendu's intentions; it is not a recovered original specification. Prefer
