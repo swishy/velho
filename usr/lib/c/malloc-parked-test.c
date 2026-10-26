@@ -1,5 +1,5 @@
-/* the livelock corner: owner parks (joins) with a full ring while
- * others keep freeing its allocations - free must not block */
+/* Cross-thread frees must complete without owner-side draining,
+ * even after the allocating thread exits. Queue locks may still spin. */
 #define _GNU_SOURCE 1
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +13,7 @@ static void *owner(void *a) {
     (void)a;
     for (int i = 0; i < N * 20000; i++) {
         hold[i] = malloc(1 + (i % 512));
-        if (!hold[i]) return 0;
+        if (!hold[i]) abort();
     }
     pthread_barrier_wait(&bar);
     return 0;   /* parks (exits) with allocations live */
@@ -22,7 +22,8 @@ static void *freer(void *a) {
     long id = (long)a;
     pthread_barrier_wait(&bar);
     for (int i = id; i < N * 20000; i += N) {
-        free(hold[i]);   /* deferred onto the parked owner's ring */
+        free(hold[i]);
+        hold[i] = NULL;
     }
     return 0;
 }
@@ -30,9 +31,13 @@ int main(void) {
     pthread_t o, f[N];
     pthread_barrier_init(&bar, NULL, N + 1);
     pthread_create(&o, NULL, owner, 0);
-    for (long i = 0; i < N; i++) pthread_create(&f[i], NULL, freer, (void*)(i+1));
+    for (long i = 0; i < N; i++) pthread_create(&f[i], NULL, freer, (void*)i);
     pthread_join(o, NULL);
     for (int i = 0; i < N; i++) pthread_join(f[i], NULL);
-    printf("PARKED OK (frees completed without blocking)\n");
+    for (int i = 0; i < N * 20000; i++) {
+        if (hold[i]) abort();
+    }
+    pthread_barrier_destroy(&bar);
+    printf("PARKED OK (all frees completed without owner assistance)\n");
     return 0;
 }

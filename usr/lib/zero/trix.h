@@ -151,7 +151,6 @@ long long llabs(long long x);
 #define haszero32(a)    (((a) - 0x01010101) & ~(a) & 0x80808080)
 
 /* count population of 1 bits in u32; store into r */
-#define onebits_32a(u32, r)
 #define onebits_32a(u32, r)                                             \
     ((r) = (u32),                                                       \
      (r) -= ((r) >> 1) & 0x55555555,                                    \

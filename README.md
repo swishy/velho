@@ -3,6 +3,11 @@
 
 Welcome to the Velho project.
 
+For the restored Zen allocator and malloc interposer, read the
+[allocator design and maintenance notes](doc/allocator-design.md) before
+changing allocation, locking or metadata handling. They describe the current
+bitmap/pointer approach, ownership invariants and validation requirements.
+
 I started Velho to grab together my earlier code, mostly the better parts mostly
 from
 

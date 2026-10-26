@@ -14,75 +14,40 @@
 #include <zen/_hash.h>
 #include <zen/mem.h>
 
-/* engine internals declared only in mem.c upstream */
-extern THREADLOCAL struct memtls *t_memtls;
-extern struct memtls *t_memtls_p;
-void meminit(struct memglob *mem);
-
 /* ------------------------------------------------------------------ */
 /* TLS + global init                                                   */
 /* ------------------------------------------------------------------ */
 
-/* full init (tables + global queue wiring + TLS) - idempotent, and
- * called from every API entry so pre-constructor allocations can never
- * observe unwired global queues (GAP-FILL(vs)) */
-static void shim_init(void);
-
+static void
 shim_tls_init(void)
 {
     struct memtls *tls;
     unsigned long  q;
 
-    if (t_memtls) {
-        return;
-    }
-    /* mmap gives zeroed memory: mtx = MTMTXINITVAL(0), nbuf 0, lists NULL */
+    /* mmap gives empty queues with the head lock bit clear. */
     tls = mapanon(-1, sizeof(struct memtls), 0);
     if (tls == MAP_FAILED || !tls) {
         return;
     }
     for (q = 0; q < MEM_BLK_QUEUES; q++) {
         tls->blktab[q].qid = q;
-        tls->blktab[q].tls = tls;
     }
     for (q = 0; q < MEM_RUN_QUEUES; q++) {
         tls->runtab[q].qid = q;
-        tls->runtab[q].tls = tls;
     }
-    m_membar();
-    /* MT: publish once via CAS - a racing loser keeps the winner's TLS
-     * and leaks its own (unused) copy rather than swapping a live one */
-    {
-        struct memtls *expect = NULL;
-        if (!__atomic_compare_exchange_n(&t_memtls, &expect, tls, 0,
-                                         __ATOMIC_ACQ_REL,
-                                         __ATOMIC_ACQUIRE)) {
-            unmapanon(tls, sizeof(struct memtls));
-
-            return;
-        }
-    }
+    t_memtls = tls;
 }
 
 static void
 shim_init(void)
 {
-    unsigned long q;
-
-    if (g_mem.flg & MEM_INIT_BIT && t_memtls) {
-
-        return;
+    /* Also handles allocations made before the constructor runs. */
+    if (!(__atomic_load_n(&g_mem.flg, __ATOMIC_ACQUIRE) & MEM_INIT_BIT)) {
+        meminit(&g_mem);
     }
-    meminit(&g_mem);
-    /* wire global queue ids (queues are in zeroed static storage) */
-    for (q = 0; q < MEM_BLK_QUEUES; q++) {
-        g_mem.blktab[q].qid = q;
+    if (!t_memtls) {
+        shim_tls_init();
     }
-    for (q = 0; q < MEM_RUN_QUEUES; q++) {
-        g_mem.runtab[q].qid = q;
-    }
-    g_mem.flg |= MEM_INIT_BIT;
-    shim_tls_init();
 }
 
 __attribute__((constructor(101)))
@@ -111,8 +76,8 @@ shim_memsize(void *ptr)
         } else if (type == MEM_RUN) {
             sz = memrunsize(memhashqid(&item));
         } else if (type == MEM_BIG) {
-            /* val = size | cnt | type-bits; size is a page multiple */
-            sz = (size_t)(item.val & ~(uintptr_t)0xFFF);
+            /* Mapping length plus type tag; length is a page multiple. */
+            sz = (size_t)(item.val & ~(uintptr_t)(PAGESIZE - 1));
         }
         if (type == MEM_BLK || type == MEM_RUN) {
             struct membuf *buf = memhashbuf(&item);
@@ -147,8 +112,6 @@ free(void *ptr)
         memput(ptr);
     }
 }
-
-/* live-range ring for overlap detection (debug builds) */
 
 void *
 calloc(size_t n, size_t size)
@@ -227,7 +190,7 @@ posix_memalign(void **memptr, size_t align, size_t size)
     void *ptr;
 
     shim_init();
-    if (!memptr || align < sizeof(void *) || (align & (align - 1))) {
+    if (align < sizeof(void *) || (align & (align - 1))) {
         return EINVAL;
     }
     ptr = memget(size, align, NULL);

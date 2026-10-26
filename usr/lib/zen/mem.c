@@ -1,8 +1,4 @@
-#include <stdlib.h>
-#include <sys/mman.h>
-#include <string.h>
 #include <errno.h>
-#include <mt/mtx.h>
 #include <zen/sys/unix.h>
 #include <zen/_hash.h>
 #include <zen/mem.h>
@@ -11,19 +7,19 @@
 struct tabhashtab              *g_memhashtab[TABHASH_SLOTS];
 struct memglob                  g_mem ALIGNED(PAGESIZE);
 THREADLOCAL struct memtls      *t_memtls;
-struct memtls                  *t_memtls_p;
 struct tabhashtab              *g_memhashbuf;
 
 #define memblkslabsize(qid)                                             \
     (((qid) <= MEM_BLK_MID_QUEUE_MIN)                                   \
-     ? (MEM_BLK_MIN_SLAB >> 2)                                          \
+     ? MEM_BLK_MIN_SLAB                                                \
      : (((qid) <= MEM_BLK_BIG_QUEUE_MIN)                                \
-        ? (MEM_BLK_MID_SLAB >> 1)                                       \
+        ? MEM_BLK_MID_SLAB                                             \
         : MEM_BLK_BIG_SLAB))
 static void
 meminitblktabs(struct memglob *mem)
 {
     for (unsigned long qid = 1; qid < MEM_BLK_QUEUES; ++qid) {
+        mem->blktab[qid].qid = qid;
         mem->nblktab[qid] = memblkslabsize(qid) / memblksize(qid);
     }
 }
@@ -34,10 +30,32 @@ meminitblktabs(struct memglob *mem)
      : (((qid) < MEM_RUN_BIG_QUEUE_MIN)                                 \
         ? MEM_RUN_MID_SLAB                                              \
         : MEM_RUN_BIG_SLAB))
+
+/* Within each slab tier, slot count decreases as the class grows.
+ * Prove both bounds at compile time, with no checks in the hot path.
+ * Configurations exceeding one word (including current 32-bit BLK
+ * geometry) must change their slab geometry before using this engine. */
+#define MEM_CHECK_TIER(slab, stride, first, last)                         \
+    _Static_assert((slab(first) / stride(first)) <= MEM_BUF_MAP_BITS     \
+                   && (slab(last) / stride(last)) > 0,                  \
+                   "every slab must contain 1..word-bits slots")
+MEM_CHECK_TIER(memblkslabsize, memblksize, 1, MEM_BLK_MID_QUEUE_MIN);
+MEM_CHECK_TIER(memblkslabsize, memblksize, MEM_BLK_MID_QUEUE_MIN + 1,
+               MEM_BLK_BIG_QUEUE_MIN);
+MEM_CHECK_TIER(memblkslabsize, memblksize, MEM_BLK_BIG_QUEUE_MIN + 1,
+               MEM_BLK_QUEUES - 1);
+MEM_CHECK_TIER(memrunslabsize, memrunsize, 1, MEM_RUN_MID_QUEUE_MIN - 1);
+MEM_CHECK_TIER(memrunslabsize, memrunsize, MEM_RUN_MID_QUEUE_MIN,
+               MEM_RUN_BIG_QUEUE_MIN - 1);
+MEM_CHECK_TIER(memrunslabsize, memrunsize, MEM_RUN_BIG_QUEUE_MIN,
+               MEM_RUN_QUEUES - 1);
+#undef MEM_CHECK_TIER
+
 static void
 meminitruntabs(struct memglob *mem)
 {
     for (unsigned long qid = 1; qid < MEM_RUN_QUEUES; ++qid) {
+        mem->runtab[qid].qid = qid;
         mem->nruntab[qid] = memrunslabsize(qid) / memrunsize(qid);
     }
 }
@@ -46,184 +64,110 @@ void
 meminit(struct memglob *mem)
 {
     mtlkfmtx(&mem->mtx);
-    if (!(mem->flg & MEM_INIT_BIT)) {
+    if (!(__atomic_load_n(&mem->flg, __ATOMIC_RELAXED) & MEM_INIT_BIT)) {
         meminitblktabs(mem);
         meminitruntabs(mem);
-        /* GAP-FILL(vs): the init bit was never set, so every memget
-         * re-ran this and early allocations could observe half-initialised
-         * state */
-        mem->flg |= MEM_INIT_BIT;
+        __atomic_store_n(&mem->flg, MEM_INIT_BIT, __ATOMIC_RELEASE);
     }
     mtunlkfmtx(&mem->mtx);
 
     return;
 }
 
-#define MEM_FIND_PAGE   0
-#define MEM_FIND_VAL    1
-uintptr_t
-memfindbuf(void *ptr, long which, uintptr_t mask)
-{
-    TABHASH_ITEM_T      item = tabhashfind(g_memhashtab, (uintptr_t)ptr);
-    uintptr_t           ret = 0;
-
-    if (item.page) {
-        switch (which) {
-            case MEM_FIND_PAGE:
-                ret = item.page;
-
-                break;
-            case MEM_FIND_VAL:
-                ret = item.val;
-            default:
-
-                break;
-        }
-    }
-    ret &= mask;
-
-    return ret;
-}
-
-/* acquire buffer header */
+/* Headers share one pool: BLK and RUN now have the same fixed layout. */
 static struct membuf *
-memgetbuf(long type)
+memgetbuf(void)
 {
-    struct membufq               *queue = NULL;
-    volatile struct membuf      **hdrq;
-    long                          ntry = 32;
-    size_t                        bufsz;
-    size_t                        nbuf;
-    struct membuf                *ret;
-    int8_t                       *ptr;
-    struct membuf                *buf;
-    struct membuf                *head;
-    struct membuf                *prev;
+    volatile struct membuf **hdrq = &g_mem.bufhdrq;
+    struct membuf *buf;
 
-    ret = NULL;
-    ptr = MAP_FAILED;
-    if (type == MEM_BLK) {
-        bufsz = memblkbufsize();
-        nbuf = MEM_CACHE_BLK_BUFS;
-        hdrq = &g_mem.blkhdrq;
-    } else {
-        bufsz = membufsize();
-        nbuf = MEM_CACHE_BUFS;
-        hdrq = &g_mem.bufhdrq;
-    }
-    do {
-        mtlkbit((m_atomic_t *)hdrq, MEM_LK_BIT_OFS);
-        ret = (void *)((uintptr_t)*hdrq & ~MEM_LK_BIT);
-        if (!ret) {
-            if (ptr == MAP_FAILED) {
-                /* map header region */
-                ptr = mapanon(-1, nbuf * bufsz, 0);
-                if (ptr != MAP_FAILED) {
-                    buf = (struct membuf *)ptr;
-                    ret = (struct membuf *)ptr;
-                    buf->queue = queue;
-                    head = (struct membuf *)((int8_t *)buf + bufsz);
-                    head->queue = queue;
-                    head->prev = NULL;
-                    prev = head;
-                    while (--nbuf) {
-                        buf = (struct membuf *)((int8_t *)buf + bufsz);
-                        buf->queue = queue;
-                        buf->prev = prev;
-                        prev->next = buf;
-                        prev = buf;
-                    }
-                    buf->next = NULL;
-                    /* GAP-FILL(vs): the issued header was never linked to
-                     * the remainder chain, so the new hdrq head read NULL
-                     * and every region orphaned all but one header */
-                    ret->next = head;
-                }
-            }
-            if (ptr != MAP_FAILED) {
-                ret = (struct membuf *)ptr;
-            }
-        }
-        if (ret) {
-            head = ret->next;
-            if (head) {
-                head->prev = NULL;
-            }
-        } else {
-            head = NULL;
-        }
-        mtunlkval((m_atomic_t *)hdrq, (m_atomic_t)(uintptr_t)head);   /* MT: paired */
-        if (!ret) {
-            m_waitspin();
-        }
-    } while (!ret && --ntry);
-
-    return ret;
-}
-
-/* release buffer header */
-static void
-memputbuf(struct membuf *buf, long type)
-{
-    volatile struct membuf    **hdrq;
-    struct membuf              *head;
-
-    /* GAP-FILL(vs): buf->adr is the in-header liveness reference - it is
-     * NULL exactly when the header is on the freelist (this function sets
-     * it, every acquire path assigns the slab). A second push of an
-     * already-free header would alias it onto two lists, so make the
-     * push idempotent on that pointer state. No refcount, no generation,
-     * no side tables. */
-    if (!buf->adr) {
-
-        return;
-    }
-    buf->adr = NULL;
-    buf->queue = NULL;
-    buf->prev = NULL;
-    if (type == MEM_BLK) {
-        hdrq = &g_mem.blkhdrq;
-    } else {
-        hdrq = &g_mem.bufhdrq;
-    }
     mtlkbit((m_atomic_t *)hdrq, MEM_LK_BIT_OFS);
-    head = (void *)((uintptr_t)*hdrq & ~MEM_LK_BIT);
-    buf->next = head;
-    if (head) {
-        head->prev = buf;
+    buf = (void *)(__atomic_load_n((m_atomic_t *)hdrq, __ATOMIC_RELAXED)
+                   & ~(uintptr_t)MEM_LK_BIT);
+    if (!buf) {
+        int8_t *region = mapanon(-1, MEM_CACHE_BUFS * membufsize(), 0);
+        if (region == MAP_FAILED) {
+            mtunlkval((m_atomic_t *)hdrq, 0);
+            return NULL;
+        }
+        buf = (struct membuf *)region;
+        for (size_t i = 0; i < MEM_CACHE_BUFS; ++i) {
+            struct membuf *cur = (struct membuf *)(region + i * membufsize());
+            cur->next = i + 1 < MEM_CACHE_BUFS
+                ? (struct membuf *)(region + (i + 1) * membufsize()) : NULL;
+        }
     }
-    mtunlkval((m_atomic_t *)hdrq, (m_atomic_t)buf);   /* MT: paired */
-
-    return;
+    mtunlkval((m_atomic_t *)hdrq, (m_atomic_t)buf->next);
+    return buf;
 }
 
-/* Queues contain only buffers with free allocations. Their head stays in
- * place until exhausted; nbuf counts all owned buffers, including full ones. */
+/* Only an empty, detached buffer returns its header to the pool. */
 static void
-memqueuebuf(struct membufq *queue, struct membuf *buf)
+memputbuf(struct membuf *buf)
 {
-    buf->prev = queue->tail;
-    buf->next = NULL;
-    if (queue->tail) {
-        queue->tail->next = buf;
-    } else {
-        queue->head = buf;
-    }
-    queue->tail = buf;
+    volatile struct membuf **hdrq = &g_mem.bufhdrq;
+
+    mtlkbit((m_atomic_t *)hdrq, MEM_LK_BIT_OFS);
+    buf->next = (void *)(__atomic_load_n((m_atomic_t *)hdrq, __ATOMIC_RELAXED)
+                         & ~(uintptr_t)MEM_LK_BIT);
+    mtunlkval((m_atomic_t *)hdrq, (m_atomic_t)buf);
+}
+
+/* Head accesses are atomic because lock waiters also read this word.
+ * All helpers below require the queue lock, except lock/unlock themselves. */
+static INLINE struct membuf *
+memqhead(struct membufq *q)
+{
+    return (struct membuf *)(__atomic_load_n((m_atomic_t *)&q->head,
+                                            __ATOMIC_RELAXED)
+                            & ~(uintptr_t)MEM_LK_BIT);
+}
+
+static INLINE void
+memqsethead(struct membufq *q, struct membuf *head)
+{
+    __atomic_store_n((m_atomic_t *)&q->head,
+                     (m_atomic_t)((uintptr_t)head | MEM_LK_BIT),
+                     __ATOMIC_RELAXED);
+}
+
+static INLINE void
+memqlock(struct membufq *q)
+{
+    mtlkbit((m_atomic_t *)&q->head, MEM_LK_BIT_OFS);
+}
+
+static INLINE void
+memqunlock(struct membufq *q)
+{
+    mtunlkval((m_atomic_t *)&q->head, (m_atomic_t)memqhead(q));
 }
 
 static void
-memdequebuf(struct membufq *queue, struct membuf *buf)
+memqueuebuf(struct membufq *q, struct membuf *buf)
+{
+    buf->prev = q->tail;
+    buf->next = NULL;
+    if (q->tail) {
+        q->tail->next = buf;
+    } else {
+        memqsethead(q, buf);
+    }
+    q->tail = buf;
+}
+
+static void
+memdequebuf(struct membufq *q, struct membuf *buf)
 {
     if (buf->prev) {
         buf->prev->next = buf->next;
     } else {
-        queue->head = buf->next;
+        memqsethead(q, buf->next);
     }
     if (buf->next) {
         buf->next->prev = buf->prev;
     } else {
-        queue->tail = buf->prev;
+        q->tail = buf->prev;
     }
     buf->prev = buf->next = NULL;
 }
@@ -232,113 +176,59 @@ static struct membuf *
 memnewbuf(unsigned long qid, long type)
 {
     size_t size = type == MEM_BLK ? memblkslabsize(qid) : memrunslabsize(qid);
-    struct membuf *buf = memgetbuf(type);
+    struct membuf *buf = memgetbuf();
     if (!buf) {
         return NULL;
     }
     buf->adr = mapanon(-1, size, 0);
     if (buf->adr == MAP_FAILED) {
-        memputbuf(buf, type);
+        memputbuf(buf);
         return NULL;
     }
     buf->size = size;
-    buf->ofs = 0;
-    if (type == MEM_BLK) {
-        buf->max = memnblk(qid);
-        for (size_t i = 0; i < buf->max; ++i) {
-            buf->tab[i] = (uintptr_t)buf->adr + i * memblksize(qid);
-        }
-    } else {
-        buf->max = memnrun(qid);
-        buf->bits = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
-    }
+    buf->max = type == MEM_BLK ? memnblk(qid) : memnrun(qid);
+    buf->bits = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
     return buf;
 }
-
-#define MEM_SEALED ((m_atomic_t)-1)
 
 static void *
 memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
 {
-    struct membufq *queue = type == MEM_BLK
+    struct membufq *q = type == MEM_BLK
         ? &t_memtls->blktab[qid] : &t_memtls->runtab[qid];
-    struct membuf *buf;
-    int8_t *ptr;
     size_t size = type == MEM_BLK ? memblksize(qid) : memrunsize(qid);
-retry:
-    if (!queue->head) {
+    memqlock(q);
+    struct membuf *buf = memqhead(q);
+    if (!buf) {
+        memqunlock(q);
         struct membufq *glob = type == MEM_BLK
             ? &g_mem.blktab[qid] : &g_mem.runtab[qid];
-        mtlkfmtx(&glob->mtx);
-        buf = glob->head;
+        memqlock(glob);
+        buf = memqhead(glob);
         if (buf) {
-            /* Only empty buffers enter the global reserve. Transfer the
-             * whole buffer once, then serve it locally. */
             memdequebuf(glob, buf);
             glob->nbuf--;
         }
-        mtunlkfmtx(&glob->mtx);
+        memqunlock(glob);
         if (!buf) {
             buf = memnewbuf(qid, type);
             if (!buf) {
                 return NULL;
             }
         }
-        buf->ofs = 0;
-        mtlkfmtx(&queue->mtx);
-        buf->queue = queue;
-        queue->nbuf++;
-        memqueuebuf(queue, buf);
-        mtunlkfmtx(&queue->mtx);
+        memqlock(q);
+        buf->queue = q;
+        q->nbuf++;
+        memqueuebuf(q, buf);
+        buf = memqhead(q);
     }
-    /* The take pairs with the free/release side under ONE hold of the
-     * queue lock: the head-usable invariant (a queued buffer always has
-     * capacity) is only released with the lock. Failed increments are
-     * undone before retry - a leaked overshoot drifts ofs past max and
-     * every later take misreads it as sealed (the 8-worker livelock). */
-    mtlkfmtx(&queue->mtx);
-    buf = queue->head;
-    if (!buf) {
-        mtunlkfmtx(&queue->mtx);
-        goto retry;
+    unsigned long index = m_ctz(buf->bits);
+    int8_t *ptr = buf->adr + index * size;
+    buf->bits &= buf->bits - 1;
+    if (!buf->bits) {
+        memdequebuf(q, buf);
     }
-    if (type == MEM_BLK) {
-        m_atomic_t old = __atomic_fetch_add(&buf->ofs, 1, __ATOMIC_ACQ_REL);
-        if (old >= (m_atomic_t)buf->max) {
-            __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
-            if (old == (m_atomic_t)buf->max && buf == queue->head) {
-                memdequebuf(queue, buf);   /* exhausted: leave now */
-            }
-            mtunlkfmtx(&queue->mtx);
-            goto retry;
-        }
-        ptr = (int8_t *)buf->tab[old];
-        mtunlkfmtx(&queue->mtx);
-    } else {
-        uintptr_t bits = __atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE);
-        if (!bits || buf->ofs == MEM_SEALED) {
-            if (buf == queue->head) {
-                memdequebuf(queue, buf);   /* exhausted or sealed */
-            }
-            mtunlkfmtx(&queue->mtx);
-            goto retry;
-        }
-        unsigned long index = m_ctz(bits);
-        uintptr_t next = bits & (bits - 1);
-        if (!__atomic_compare_exchange_n(&buf->bits, &bits, next, 1,
-                                         __ATOMIC_ACQ_REL,
-                                         __ATOMIC_ACQUIRE)) {
-            mtunlkfmtx(&queue->mtx);
-            goto retry;
-        }
-        ptr = buf->adr + index * size;
-        if (!next && buf == queue->head) {
-            memdequebuf(queue, buf);       /* exhausted */
-        }
-        mtunlkfmtx(&queue->mtx);
-    }
-
-    /* Ordinary blocks/runs already satisfy the minimum alignment. */
+    memqunlock(q);
     if (align > (type == MEM_BLK ? CLSIZE : PAGESIZE)) {
         int8_t *aligned = memalignptr(ptr, align);
         if (retsize) {
@@ -352,55 +242,38 @@ retry:
     return ptr;
 }
 
-/* An empty buffer is either retained, transferred to the global reserve,
- * or unmapped. All its page references have already been released. */
+/* Caller holds the owner lock. The last free is the only operation that
+ * can transfer or unmap a slab; all page references are already gone.
+ * Nested lock order is local -> global. Allocation drops global first. */
 static void
 memreleaseempty(struct membuf *buf, long type)
 {
-    /* caller holds the owning queue lock; the state was re-derived from
-     * the atomic mark, so the buffer is genuinely empty */
-    struct membufq *queue = buf->queue;
-    unsigned long qid = queue->qid;
+    struct membufq *q = buf->queue;
+    unsigned long qid = q->qid;
     long limit = type == MEM_BLK ? memnblktlsbuf(qid) : memnruntlsbuf(qid);
-    if (queue->nbuf <= limit) {
-        return;                     /* keep the empty buffer local */
+    if (q->nbuf <= limit) {
+        return;
     }
-    m_atomic_t exp = 0;
-    if (type == MEM_BLK) {
-        if (!__atomic_compare_exchange_n(&buf->ofs, &exp, MEM_SEALED, 0,
-                                         __ATOMIC_ACQ_REL,
-                                         __ATOMIC_ACQUIRE)) {
-            return;                 /* an allocator took a block */
-        }
-    } else {
-        uintptr_t bits = __atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE);
-        uintptr_t full = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
-        if (bits != full || buf->ofs == MEM_SEALED) {
-            return;
-        }
-        buf->ofs = MEM_SEALED;      /* under the queue lock */
-    }
-    memdequebuf(queue, buf);
-    queue->nbuf--;
+    memdequebuf(q, buf);
+    q->nbuf--;
     struct membufq *glob = type == MEM_BLK
         ? &g_mem.blktab[qid] : &g_mem.runtab[qid];
     limit = type == MEM_BLK ? memnblkbuf(qid) : memnrunbuf(qid);
-    mtlkfmtx(&glob->mtx);
+    memqlock(glob);
     if (glob->nbuf < limit) {
-        buf->ofs = 0;               /* unseal: reusable from the reserve */
         buf->queue = glob;
         glob->nbuf++;
         memqueuebuf(glob, buf);
-        mtunlkfmtx(&glob->mtx);
+        memqunlock(glob);
     } else {
-        mtunlkfmtx(&glob->mtx);
+        memqunlock(glob);
         memfreebuf(buf);
-        memputbuf(buf, type);
+        memputbuf(buf);
     }
 }
 
 /* acquire big allocation */
-void *
+static void *
 memgetbig(size_t size, size_t align, size_t *retsize)
 {
     /* GAP-FILL(vs): the acquired buffer header was vestigial - never
@@ -426,7 +299,7 @@ memgetbig(size_t size, size_t align, size_t *retsize)
             unmapanon(ptr, aln);
             mapsz -= aln;
         }
-        page = memsethashpage(mempageadr(ret), MEM_BIG);
+        page = mempageadr(ret);
         val = mapsz | (MEM_BIG << MEM_BUF_QUEUE_BITS);
         tabhashadd(g_memhashtab, page, val);
         if (retsize) {
@@ -453,7 +326,7 @@ memget(size_t size, size_t align, size_t *retsize)
         errno = ENOMEM;
         return NULL;
     }
-    if (!(g_mem.flg & MEM_INIT_BIT)) {
+    if (!(__atomic_load_n(&g_mem.flg, __ATOMIC_ACQUIRE) & MEM_INIT_BIT)) {
         meminit(&g_mem);
     }
     qid = memblkqid(alnsz);
@@ -478,41 +351,23 @@ memput(void *ptr)
     }
     long type = memhashtype(&hash);
     if (type == MEM_BIG) {
-        size_t size = (size_t)(hash.val & ~(uintptr_t)(PAGESIZE - 1));
-        unmapanon((void *)page, size);
+        unmapanon((void *)page, hash.val & ~(uintptr_t)(PAGESIZE - 1));
         return;
     }
+    /* This allocation's clear bit keeps its header and owner alive until
+     * we hold the owner lock and mark it free. */
     struct membuf *buf = memhashbuf(&hash);
-    struct membufq *queue = buf->queue;
-    unsigned long qid = queue->qid;
-    /* Removal returned the packed owner. The mark itself is atomic
-     * (bits/ofs are RMW words - lock bts/btr is atomic on any silicon),
-     * so ANY thread applies the free directly; the block is allocatable
-     * immediately. Queue membership changes only at lifecycle
-     * transitions, under the queue lock. */
-    mtlkfmtx(&queue->mtx);
-    if (type == MEM_BLK) {
-        size_t index = memblknum(qid, buf, ptr);
-        m_atomic_t old = __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
-        buf->tab[old - 1] = (uintptr_t)buf->adr + index * memblksize(qid);
-        if (old == (m_atomic_t)buf->max
-            && queue->head != buf && !buf->prev && !buf->next) {
-            memqueuebuf(queue, buf);       /* revival: exactly-once */
-        }
-        if (old == 1) {
-            memreleaseempty(buf, type);    /* last free */
-        }
-    } else {
-        size_t index = memrunnum(qid, buf, ptr);
-        uintptr_t bit = (uintptr_t)1 << index;
-        uintptr_t old = __atomic_fetch_or(&buf->bits, bit, __ATOMIC_ACQ_REL);
-        uintptr_t full = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
-        if (!old && queue->head != buf && !buf->prev && !buf->next) {
-            memqueuebuf(queue, buf);       /* revival: exactly-once */
-        }
-        if ((old | bit) == full) {
-            memreleaseempty(buf, type);    /* last free */
-        }
+    struct membufq *q = buf->queue;
+    size_t size = type == MEM_BLK ? memblksize(q->qid) : memrunsize(q->qid);
+    size_t index = ((uintptr_t)ptr - (uintptr_t)buf->adr) / size;
+    memqlock(q);
+    uintptr_t old = buf->bits;
+    buf->bits = old | ((uintptr_t)1 << index);
+    if (!old) {
+        memqueuebuf(q, buf);
     }
-    mtunlkfmtx(&queue->mtx);
+    if (buf->bits == (UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max))) {
+        memreleaseempty(buf, type);
+    }
+    memqunlock(q);
 }

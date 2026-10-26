@@ -5,9 +5,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <signal.h>
-#include <ucontext.h>
-#include <dlfcn.h>
 #include <malloc.h>
 
 #define CHK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
@@ -20,84 +17,9 @@ rnd(void)
     return rng;
 }
 
-static void *g_cur_ptr;
-static int g_cur_i;
-static size_t g_cur_sz;
-extern __thread struct memtls *t_memtls;
-extern struct memglob g_mem;
-struct membufq2 { volatile long mtx; unsigned long qid; long nbuf; void *tls; struct membuf2 *head; struct membuf2 *tail; long pad[2]; };
-struct membuf2 { char *adr; size_t size; size_t ofs; size_t max; uintptr_t bits; void *queue; struct membuf2 *prev; struct membuf2 *next; };
-static void
-onsegv2(int sig, siginfo_t *si, void *uc)
-{
-    (void)sig; (void)uc;
-    char b[256];
-    int o = snprintf(b, 200,
-        "VERIFY-SEGV addr=%p i=%d ptr=%p sz=%zu\n",
-        si->si_addr, g_cur_i, g_cur_ptr, g_cur_sz);
-    if (o > 0) { ssize_t w = write(2, b, o); (void)w; }
-    if (t_memtls) {
-        for (int tbl = 0; tbl < 2; tbl++) {
-            for (int q = 0; q < 64; q++) {
-                struct membufq2 *qu = tbl
-                    ? (struct membufq2 *)((char *)t_memtls + 64 * 64 * 8 /*placeholder*/)
-                    : (struct membufq2 *)((char *)t_memtls + (size_t)q * 64);
-                (void)qu;
-            }
-        }
-        /* walk both tables via byte offsets (membufq = 64 bytes) */
-        for (int tbl = 0; tbl < 2; tbl++) {
-            for (int q = 0; q < 64; q++) {
-                struct membufq2 *qu = (struct membufq2 *)
-                    ((char *)t_memtls + tbl * 4096 + q * 64);
-                for (struct membuf2 *bf = qu->head; bf && bf != bf->next; bf = bf->next) {
-                    if ((char *)g_cur_ptr >= bf->adr
-                        && (char *)g_cur_ptr < bf->adr + bf->size) {
-                        o = snprintf(b, 240,
-                            "OWNER tbl=%d q=%lu buf=%p adr=%p size=0x%zx bits=%lx max=%zx nbuf=%ld\n",
-                            tbl, qu->qid, (void *)bf, (void *)bf->adr,
-                            bf->size, (unsigned long)bf->bits, bf->max, qu->nbuf);
-                        if (o > 0) { ssize_t w2 = write(2, b, o); (void)w2; }
-                    }
-                }
-            }
-        }
-    }
-    _exit(93);
-}
-
-static void
-onalrm(int sig, siginfo_t *si, void *uc)
-{
-    (void)sig; (void)si;
-    ucontext_t *u = uc;
-    char b[128];
-    unsigned long long rp = u->uc_mcontext.gregs[REG_RIP];
-    unsigned long long rc = u->uc_mcontext.gregs[REG_RCX];
-    unsigned long long wd = *(unsigned long long *)rc;
-    int o = snprintf(b, 120, "ALARM rip=%llx word=%llx\n", rp, wd);
-    if (o > 0) { ssize_t w = write(2, b, o); (void)w; }
-    _exit(97);
-}
-
 int
 main(void)
 {
-    struct sigaction sa = {0};
-    sa.sa_sigaction = onalrm; sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGALRM, &sa, NULL);
-    alarm(3);
-    sa.sa_sigaction = onsegv2;
-    sigaction(SIGSEGV, &sa, NULL);
-    { void *m = dlsym(RTLD_DEFAULT, "malloc"); char b[80];
-      int o = snprintf(b, 70, "malloc-sym=%p\n", m);
-      if (o > 0) { ssize_t w = write(2, b, o); (void)w; }
-      FILE *f = fopen("/proc/self/maps", "r");
-      if (f) { char line[512];
-          while (fgets(line, sizeof line, f))
-              if (strstr(line, "velho") || strstr(line, "mimalloc"))
-                  fputs(line, stderr);
-          fclose(f); } }
     alarm(30);
 
     void *p;
@@ -150,7 +72,6 @@ main(void)
         unsigned char tf = fills[i]; fills[i] = fills[j]; fills[j] = tf;
     }
     for (int i = 0; i < NLIVE; i++) {
-        g_cur_ptr = live[i]; g_cur_i = i; g_cur_sz = szs[i];
         for (size_t j = 0; j < szs[i]; j += 131) CHK(live[i][j] == fills[i]);
         free(live[i]);
     }
