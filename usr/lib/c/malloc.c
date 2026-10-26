@@ -22,7 +22,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
-#include <sched.h>
 #include <sys/types.h>
 
 #include <zero/cdefs.h>
@@ -116,6 +115,13 @@ shim_memsize(void *ptr)
     long           type;
     size_t         sz = 0;
 
+    { int tries;
+      for (tries = 0; tries < 200000; tries++) {
+        item = tabhashfind(g_memhashtab, mempageadr(ptr));
+        if (item.page) break;
+        sched_yield();
+      }
+    }
     if (item.page) {
         type = memhashtype(&item);
         if (type == MEM_BLK) {

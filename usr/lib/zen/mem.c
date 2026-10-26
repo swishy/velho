@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -366,21 +367,59 @@ memgetblk(unsigned long qid, size_t align, size_t *retsize)
     uintptr_t           page;
     uintptr_t           val;
 
-    buf = t_memtls ? t_memtls->blktab[qid].head : NULL;
-    while (buf && buf->ofs >= buf->max && buf->next != buf) {
-        if (UNLIKELY(!buf->adr || buf->ofs > buf->max
-                     || buf->queue != &t_memtls->blktab[qid])) {
-            char _b[160]; int _o = snprintf(_b, 150,
-                "TLSWALK-POISON qid=%lu buf=%p adr=%p ofs=%ld max=%ld q=%p\n",
-                qid, (void *)buf, (void *)buf->adr,
-                (long)buf->ofs, (long)buf->max, (void *)buf->queue);
-            if (write(2, _b, _o)) {}
-            abort();
+    /* magazine fast path: pop the available-stack, validating entries
+     * (stale entries - handed off, released, or re-exhausted - skip).
+     * This replaces the queue walk, which was O(live buffers) per
+     * allocation and the volume quadratic. */
+    buf = NULL;
+    if (t_memtls) {
+        struct membuf *av = t_memtls->availblk[qid];
+        struct membuf *pv = NULL;
+        while (av) {
+            if (av->ofs < av->max && av->adr
+                && av->queue == &t_memtls->blktab[qid]) {
+                break;
+            }
+            /* stale: unlink it from the stack (leaving it linked let a
+             * re-push double-link the node into a cycle) */
+            if (pv) {
+                pv->anext = av->anext;
+            } else {
+                t_memtls->availblk[qid] = av->anext;
+            }
+            av->availf = 0;
+            av->anext = NULL;
+            av = (pv ? pv->anext : t_memtls->availblk[qid]);
         }
-        buf = buf->next;                /* exhausted - stay linked, skip */
-    }
-    if (buf && buf->ofs >= buf->max) {
-        buf = NULL;
+        if (av) {
+            if (pv) {
+                pv->anext = av->anext;
+            } else {
+                t_memtls->availblk[qid] = av->anext;
+            }
+            av->anext = NULL;
+            av->availf = 0;
+            buf = av;
+            ptr = (int8_t *)buf->tab[buf->ofs];
+            buf->ofs++;
+            if (buf->ofs == buf->max) {
+                t_memtls->blktab[qid].nusable--;
+            }
+            ret = memalignptr(ptr, align);
+            if (ret) {
+                size_t o2 = buf->max + memblknum(qid, buf, ret);
+                buf->tab[o2] = (uintptr_t)(ret - ptr);
+                { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_BLK);
+                  uintptr_t vl = memsethashbuf(buf, qid, MEM_BLK);
+                  if (!tabhashaddref(g_memhashtab, pg, vl)) {
+                      tabhashadd(g_memhashtab, pg, vl);
+                  }
+                  if (retsize) { *retsize = blksz; } }
+            }
+
+
+            return ret;
+        }
     }
     if (!buf) {
         mtlkfmtx(&g_mem.blktab[qid].mtx);
@@ -460,6 +499,10 @@ memgetblk(unsigned long qid, size_t align, size_t *retsize)
                 ptr = (int8_t *)buf->tab[0];
                 buf->ofs = 1;
                 mempushbuf(&t_memtls->blktab[qid], buf);
+                t_memtls->blktab[qid].nusable++;
+                buf->availf = 1;
+                buf->anext = t_memtls->availblk[qid];
+                t_memtls->availblk[qid] = buf;
             }
         } else {
             /* GAP-FILL(vs): a usable global buffer stays on the global
@@ -533,12 +576,56 @@ memgetrun(unsigned long qid, size_t align, size_t *retsize)
     uintptr_t           val;
     uintptr_t           diff;
 
-    buf = t_memtls ? t_memtls->runtab[qid].head : NULL;
-    while (buf && !buf->bits && buf->next != buf) {
-        buf = buf->next;                /* exhausted - stay linked, skip */
-    }
-    if (buf && !buf->bits) {
-        buf = NULL;
+    /* magazine fast path: pop the run available-stack (see memgetblk) */
+    buf = NULL;
+    if (t_memtls) {
+        struct membuf *av = t_memtls->availrun[qid];
+        struct membuf *pv = NULL;
+        while (av) {
+            if (av->bits && av->adr
+                && av->queue == &t_memtls->runtab[qid]) {
+                break;
+            }
+            if (pv) {
+                pv->anext = av->anext;
+            } else {
+                t_memtls->availrun[qid] = av->anext;
+            }
+            av->availf = 0;
+            av->anext = NULL;
+            av = (pv ? pv->anext : t_memtls->availrun[qid]);
+        }
+        if (av) {
+            if (pv) {
+                pv->anext = av->anext;
+            } else {
+                t_memtls->availrun[qid] = av->anext;
+            }
+            av->anext = NULL;
+            av->availf = 0;
+            buf = av;
+            { long b2 = buf->bits;
+              long o2 = m_ctz(b2);
+              ptr = buf->adr + ((o2 << PAGESIZELOG2) * qid);
+              buf->bits = b2 & ~(1L << o2);
+              if (!buf->bits) {
+                  t_memtls->runtab[qid].nusable--;
+              }
+              ret = memalignptr(ptr, align);
+              if (ret) {
+                  ofs = memrunnum(qid, buf, ret);
+                  buf->tab[ofs] = (uintptr_t)(ret - ptr);
+                  { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_RUN);
+                    uintptr_t vl = memsethashbuf(buf, qid, MEM_RUN);
+                    if (!tabhashaddref(g_memhashtab, pg, vl)) {
+                        tabhashadd(g_memhashtab, pg, vl);
+                    }
+                    if (retsize) { *retsize = memrunsize(qid); } }
+              }
+ }
+
+            return ret;
+        }
     }
     if (!buf) {
         mtlkfmtx(&g_mem.runtab[qid].mtx);
@@ -562,6 +649,8 @@ memgetrun(unsigned long qid, size_t align, size_t *retsize)
             gptr = buf->adr + gofs;
             buf->bits = gbits;
             gbuf = buf;
+        }
+        if (gbuf) {
         }
         if (!buf) {
             slabsz = memrunslabsize(qid);
@@ -594,6 +683,10 @@ memgetrun(unsigned long qid, size_t align, size_t *retsize)
                 buf->max = nrun;
                 buf->queue = &t_memtls->runtab[qid];
                 mempushbuf(&t_memtls->runtab[qid], buf);
+                t_memtls->runtab[qid].nusable++;
+                buf->availf = 1;
+                buf->anext = t_memtls->availrun[qid];
+                t_memtls->availrun[qid] = buf;
             }
         } else {
             mtunlkfmtx(&g_mem.runtab[qid].mtx);
@@ -602,16 +695,22 @@ memgetrun(unsigned long qid, size_t align, size_t *retsize)
     if (buf && ptr) {
         /* fresh buffer: first run selected above */
         ret = memalignptr(ptr, align);
-    } else if (buf) {
+    } else if (buf && !gbuf) {
+        /* leftover walk branch: MUST NOT run when the global path already
+         * selected from this buffer via gbuf - it double-served (the
+         * gbuf take consumed the bit; ctz on the updated bitmap handed
+         * wild offsets, e.g. ctz(0)*stride far outside the slab) */
         bits = buf->bits;
-        ofs = m_ctz(bits);
-        mask = ~(1L << ofs);
-        ofs <<= PAGESIZELOG2;
-        ofs *= qid;
-        bits &= mask;
-        ptr = buf->adr + ofs;
-        buf->bits = bits;               /* exhausted stays linked */
-        ret = memalignptr(ptr, align);
+        if (bits) {
+            ofs = m_ctz(bits);
+            mask = ~(1L << ofs);
+            ofs <<= PAGESIZELOG2;
+            ofs *= qid;
+            bits &= mask;
+            ptr = buf->adr + ofs;
+            buf->bits = bits;           /* exhausted stays linked */
+            ret = memalignptr(ptr, align);
+        }
     }
     if (gbuf && !ret) {
         buf = gbuf;
@@ -821,6 +920,9 @@ memputblk(struct membuf *buf, void *ptr)
     /* GAP-FILL(vs): with buffers permanently linked there is nothing to
      * requeue - the old tail-reinsert double-linked live buffers */
     if (!ndx && nbuf > lim) {
+        if (queue->nusable > 0) {
+            queue->nusable--;   /* usable buffer leaves the queue */
+        }
         memdequebuf(queue, buf);
         if (!tls) {
             mempurgebufentries(buf, PAGESIZE);
@@ -845,6 +947,7 @@ memputblk(struct membuf *buf, void *ptr)
                                       * must route to the queue that
                                       * now owns the buffer */
                 mempushbuf(glob, buf);
+                glob->nusable++;    /* empty/all-free buffer is usable */
             }
             mtunlkfmtx(&glob->mtx);
         }
@@ -888,6 +991,9 @@ memputrun(struct membuf *buf, void *adr)
         mask = (uintptr_t)1 << nrun;
         mask--;
         if (bits == mask && nbuf > lim) {
+            if (queue->nusable > 0) {
+                queue->nusable--;   /* usable buffer leaves the queue */
+            }
             memdequebuf(queue, buf);
             if (!tls) {
                 if (UNLIKELY(buf->bits != (((uintptr_t)1 << buf->max) - 1))) {
@@ -918,6 +1024,7 @@ memputrun(struct membuf *buf, void *adr)
                 } else {
                     buf->queue = glob;   /* MT: rebind on handoff */
                     mempushbuf(glob, buf);
+                    glob->nusable++;    /* empty/all-free buffer is usable */
                 }
                 mtunlkfmtx(&glob->mtx);
             }
@@ -1083,8 +1190,19 @@ memputblk_locked(struct membuf *buf, void *ptr, unsigned long qid)
     max = buf->max - 1;
     nbuf = queue->nbuf;
     buf->tab[ndx] = (uintptr_t)adr;   /* block returns to the free-stack */
+    if (ndx == buf->max - 1) {
+        queue->nusable++;      /* exhausted buffer has room again */
+        if (tls && !(buf->availf)) {
+            buf->availf = 1;
+            buf->anext = ((struct memtls *)tls)->availblk[qid];
+            ((struct memtls *)tls)->availblk[qid] = buf;
+        }
+    }
     buf->ofs = ndx;
     if (!ndx && nbuf > lim) {
+        if (queue->nusable > 0) {
+            queue->nusable--;   /* usable buffer leaves the queue */
+        }
         memdequebuf(queue, buf);
         if (!tls) {
             mempurgebufentries(buf, PAGESIZE);
@@ -1106,6 +1224,7 @@ memputblk_locked(struct membuf *buf, void *ptr, unsigned long qid)
                                       * must route to the queue that
                                       * now owns the buffer */
                 mempushbuf(glob, buf);
+                glob->nusable++;    /* empty/all-free buffer is usable */
             }
             mtunlkfmtx(&glob->mtx);
         }
@@ -1127,10 +1246,21 @@ memputrun_locked(struct membuf *buf, void *ptr, unsigned long qid)
     uintptr_t           mask = (uintptr_t)1 << ndx;
     struct membufq     *glob;
 
+    if (!bits) {
+        queue->nusable++;      /* exhausted buffer has a free run again */
+        if (tls && !(buf->availf)) {
+            buf->availf = 1;   /* set BEFORE bits |= mask */
+            buf->anext = ((struct memtls *)tls)->availrun[qid];
+            ((struct memtls *)tls)->availrun[qid] = buf;
+        }
+    }
     bits |= mask;
     buf->bits = bits;
     mask = ((uintptr_t)1 << nrun) - 1;
     if (bits == mask && nbuf > lim) {
+        if (queue->nusable > 0) {
+            queue->nusable--;   /* usable buffer leaves the queue */
+        }
         memdequebuf(queue, buf);
         if (!tls) {
             mempurgebufentries(buf, PAGESIZE * qid);
@@ -1152,6 +1282,7 @@ memputrun_locked(struct membuf *buf, void *ptr, unsigned long qid)
                                       * must route to the queue that
                                       * now owns the buffer */
                 mempushbuf(glob, buf);
+                glob->nusable++;    /* empty/all-free buffer is usable */
             }
             mtunlkfmtx(&glob->mtx);
         }
@@ -1226,8 +1357,18 @@ memput(void *ptr)
         }
         if (type == MEM_BLK) {
             memputblk_locked(buf, ptr, queue->qid);
+            if (queue->tls
+                && !((struct memtls *)queue->tls)->curblk[queue->qid]
+                && buf->ofs < buf->max && buf->queue == queue) {
+                ((struct memtls *)queue->tls)->curblk[queue->qid] = buf;
+            }
         } else {
             memputrun_locked(buf, ptr, queue->qid);
+            if (queue->tls
+                && !((struct memtls *)queue->tls)->currun[queue->qid]
+                && buf->bits && buf->queue == queue) {
+                ((struct memtls *)queue->tls)->currun[queue->qid] = buf;
+            }
         }
         tabhashrm(g_memhashtab, page);   /* slot under queue: lock order */
         if (!queue->tls) {

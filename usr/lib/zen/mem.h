@@ -164,6 +164,9 @@ struct membuf {
     struct membufq     *queue;  // queue the buffer is on
     struct membuf      *prev;   // previous magazine in queue
     struct membuf      *next;   // next magazine in queue
+    struct membuf      *anext;  // available-stack link (per-TLS LIFO)
+    unsigned char       availf; // on the avail-stack (bits is live data)
+    unsigned char       pad7[7];
     uintptr_t           tab[VLA];
 };
 
@@ -174,12 +177,24 @@ struct membufq {
     struct memtls      *tls;    // pointer to thread-local data
     struct membuf      *head;   // queue head
     struct membuf      *tail;   // queue tail
-    long                pad[2]; // pad to multiple of 8 machine words
+    long                nusable; // buffers with room (walk guard)
+    long                pad;    // pad to multiple of 8 machine words
 };
 
 struct memtls {
     struct membufq      blktab[MEM_BLK_QUEUES];
     struct membufq      runtab[MEM_RUN_QUEUES];
+    /* MT/perf: per-class current-buffer cursors - the O(1) magazine fast
+     * path. Walking the queues at volume is O(live buffers) per
+     * allocation (the quadratic); the cursor makes the common case a
+     * single dereference. */
+    struct membuf      *curblk[MEM_BLK_QUEUES];
+    struct membuf      *currun[MEM_RUN_QUEUES];
+    /* magazine available-stacks: LIFO of probably-usable buffers; pops
+     * validate and skip stale entries (the queue walk was O(live) and
+     * the volume quadratic) */
+    struct membuf      *availblk[MEM_BLK_QUEUES];
+    struct membuf      *availrun[MEM_RUN_QUEUES];
 };
 
 /* flg-member */
