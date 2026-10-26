@@ -1,21 +1,7 @@
-/* velho malloc(3) interposer - gap-filling layer for vendu's velho
- * (github.com/vendu/velho) usr/lib/zen allocator.
- *
- * The engine (zen/mem.c) is used as-is except for two marked GAP-FILL
- * edits in mem-fixed.c (runtab typo + claim-to-TLS on the global recycle
- * paths). This file fills the rest of what upstream never finished:
- *
- *   - vnd/ redirect headers (the vnd/ layer does not exist upstream);
- *   - thread-local store init: t_memtls is declared but never assigned
- *     anywhere in the tree, and membufq.qid/tls are never wired;
- *   - an actual size lookup for realloc and malloc_usable_size (upstream
- *     stubs memsize() out with a literal zero);
- *   - a malloc(3) API without the upstream shim's bugs (calloc
- *     allocated n*size but passed `size` to memget; realloc returned
- *     the OLD pointer).
- *
- * Sizes are decoded strictly through the engine's own packed-accessor
- * macros (memhashtype/memhashqid/memblksize/...) - never re-derived.
+/* malloc(3) interposer for vendu's zen allocator.
+ * The engine owns slabs, size-class queues and packed page metadata;
+ * this shim supplies process/TLS initialization and libc entry points.
+ * Usable capacity is decoded from the same metadata as the free path.
  */
 
 #include <stddef.h>
@@ -28,64 +14,40 @@
 #include <zen/_hash.h>
 #include <zen/mem.h>
 
-/* engine internals declared only in mem.c upstream */
-extern THREADLOCAL struct memtls *t_memtls;
-extern struct memtls *t_memtls_p;
-void meminit(struct memglob *mem);
-
 /* ------------------------------------------------------------------ */
 /* TLS + global init                                                   */
 /* ------------------------------------------------------------------ */
 
-/* full init (tables + global queue wiring + TLS) - idempotent, and
- * called from every API entry so pre-constructor allocations can never
- * observe unwired global queues (GAP-FILL(vs)) */
-static void shim_init(void);
 static void
 shim_tls_init(void)
 {
     struct memtls *tls;
     unsigned long  q;
 
-    if (t_memtls) {
-        return;
-    }
-    /* mmap gives zeroed memory: mtx = MTMTXINITVAL(0), nbuf 0, lists NULL */
+    /* mmap gives empty queues with the head lock bit clear. */
     tls = mapanon(-1, sizeof(struct memtls), 0);
     if (tls == MAP_FAILED || !tls) {
         return;
     }
     for (q = 0; q < MEM_BLK_QUEUES; q++) {
         tls->blktab[q].qid = q;
-        tls->blktab[q].tls = tls;
     }
     for (q = 0; q < MEM_RUN_QUEUES; q++) {
         tls->runtab[q].qid = q;
-        tls->runtab[q].tls = tls;
     }
-    m_membar();
     t_memtls = tls;
 }
 
 static void
 shim_init(void)
 {
-    unsigned long q;
-
-    if (g_mem.flg & MEM_INIT_BIT && t_memtls) {
-
-        return;
+    /* Also handles allocations made before the constructor runs. */
+    if (!(__atomic_load_n(&g_mem.flg, __ATOMIC_ACQUIRE) & MEM_INIT_BIT)) {
+        meminit(&g_mem);
     }
-    meminit(&g_mem);
-    /* wire global queue ids (queues are in zeroed static storage) */
-    for (q = 0; q < MEM_BLK_QUEUES; q++) {
-        g_mem.blktab[q].qid = q;
+    if (!t_memtls) {
+        shim_tls_init();
     }
-    for (q = 0; q < MEM_RUN_QUEUES; q++) {
-        g_mem.runtab[q].qid = q;
-    }
-    g_mem.flg |= MEM_INIT_BIT;
-    shim_tls_init();
 }
 
 __attribute__((constructor(101)))
@@ -114,8 +76,12 @@ shim_memsize(void *ptr)
         } else if (type == MEM_RUN) {
             sz = memrunsize(memhashqid(&item));
         } else if (type == MEM_BIG) {
-            /* val = size | cnt | type-bits; size is a page multiple */
-            sz = (size_t)(item.val & ~(uintptr_t)0xFFF);
+            /* Mapping length plus type tag; length is a page multiple. */
+            sz = (size_t)(item.val & ~(uintptr_t)(PAGESIZE - 1));
+        }
+        if (type == MEM_BLK || type == MEM_RUN) {
+            struct membuf *buf = memhashbuf(&item);
+            sz -= ((uintptr_t)ptr - (uintptr_t)buf->adr) % sz;
         }
     }
 
@@ -146,8 +112,6 @@ free(void *ptr)
         memput(ptr);
     }
 }
-
-/* live-range ring for overlap detection (debug builds) */
 
 void *
 calloc(size_t n, size_t size)
@@ -226,7 +190,7 @@ posix_memalign(void **memptr, size_t align, size_t size)
     void *ptr;
 
     shim_init();
-    if (!memptr || align < sizeof(void *) || (align & (align - 1))) {
+    if (align < sizeof(void *) || (align & (align - 1))) {
         return EINVAL;
     }
     ptr = memget(size, align, NULL);

@@ -1,0 +1,120 @@
+name: Malloc
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Allocator ${{ matrix.opt }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        opt: [O0, O2, O3]
+    env:
+      BUILD_DIR: ${{ runner.temp }}/malloc-${{ matrix.opt }}
+      OPT: ${{ matrix.opt }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build allocator and tests
+        run: |
+          set -o pipefail
+          mkdir -p "$BUILD_DIR"
+          usr/lib/c/build-malloc.sh "$BUILD_DIR" "-$OPT" 2>&1 | tee "$BUILD_DIR/build.log"
+      - name: Run allocator suite and Perl smoke test
+        run: |
+          set -o pipefail
+          usr/lib/c/test-malloc.sh "$BUILD_DIR" 2>&1 | tee "$BUILD_DIR/tests.log"
+      - name: Preserve test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: malloc-logs-${{ matrix.opt }}
+          path: ${{ env.BUILD_DIR }}/*.log
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Package tested O2 library
+        if: matrix.opt == 'O2'
+        run: |
+          package="$RUNNER_TEMP/velhomalloc-linux-x86_64"
+          mkdir -p "$package" dist
+          cp "$BUILD_DIR/libvelhomalloc.so" "$package/"
+          cp LICENSE "$package/"
+          cp doc/allocator-design.md "$package/DESIGN.md"
+          cat > "$package/README.txt" <<'EOF'
+          Velho malloc interposer for Linux x86-64, built with GCC -O2 on Ubuntu 24.04.
+          See BUILDINFO.txt for the exact compiler and glibc versions.
+          Requires a compatible Linux/glibc environment; this is not a portable binary.
+          Unpack, then use an absolute library path, for example:
+            LD_PRELOAD="$(pwd)/libvelhomalloc.so" your-program
+          SHA256SUMS verifies the release archive. LICENSE contains the license terms.
+          EOF
+          {
+            printf 'Commit: %s\nOptimization: -O2\nPlatform: Linux x86-64\n' "$GITHUB_SHA"
+            cc --version
+            ldd --version
+          } > "$package/BUILDINFO.txt"
+          tar -C "$RUNNER_TEMP" -czf dist/velhomalloc-linux-x86_64.tar.gz \
+            velhomalloc-linux-x86_64
+          (cd dist && sha256sum velhomalloc-linux-x86_64.tar.gz > SHA256SUMS)
+      - name: Preserve tested release package
+        if: matrix.opt == 'O2'
+        uses: actions/upload-artifact@v7
+        with:
+          name: velhomalloc-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish malloc release
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: velhomalloc-linux-x86_64
+          path: dist
+      - name: Verify release archive
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      - name: Publish commit-specific release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="malloc-$GITHUB_SHA"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Linux x86-64 malloc interposer built from commit $GITHUB_SHA on Ubuntu 24.04.
+
+          The O2 binary passed the allocator suite and Perl churn smoke test.
+          O0 and O3 builds also passed. The archive includes the library, license,
+          design notes and build metadata; verify it with SHA256SUMS before use.
+
+          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          # A successful rerun refreshes assets on the same commit's release.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+              --title "Velho malloc ${GITHUB_SHA:0:12}" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi

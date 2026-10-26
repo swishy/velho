@@ -304,7 +304,7 @@ m_cmpsetbit32(volatile m_atomic32_t *lp, int32_t ndx)
                               "jnc 1f\n"
                               "incl %1\n"
                               "1:\n"
-                              : "+m" (*(lp)), "=r" (val)
+                              : "+m" (*(lp)), "+r" (val)
                               : "i" (ndx)
                               : "cc", "memory");
     } else {
@@ -312,7 +312,7 @@ m_cmpsetbit32(volatile m_atomic32_t *lp, int32_t ndx)
                               "jnc 1f\n"
                               "incl %1\n"
                               "1:\n"
-                              : "+m" (*(lp)), "=r" (val)
+                              : "+m" (*(lp)), "+r" (val)
                               : "r" (ndx)
                               : "cc", "memory");
     }
@@ -331,7 +331,7 @@ m_cmpclrbit32(volatile m_atomic32_t *lp, int32_t ndx)
                               "jnc 1f\n"
                               "incl %1\n"
                               "1:\n"
-                              : "+m" (*(lp)), "=r" (val)
+                              : "+m" (*(lp)), "+r" (val)
                               : "i" (ndx)
                               : "cc", "memory");
     } else {
@@ -339,7 +339,7 @@ m_cmpclrbit32(volatile m_atomic32_t *lp, int32_t ndx)
                               "jnc 1f\n"
                               "incl %1\n"
                               "1:\n"
-                              : "+m" (*(lp)), "=r" (val)
+                              : "+m" (*(lp)), "+r" (val)
                               : "r" (ndx)
                               : "cc", "memory");
     }

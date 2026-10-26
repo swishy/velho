@@ -71,10 +71,10 @@ mtlkfmtx(volatile m_atomic_t *lp)
 {
     m_atomic_t  res = 0;
 
+    /* GAP-FILL(vs): the registry/re-entrancy tolerance is gone - the
+     * "recursive locking" was the cmpsetbit result-register fault, not
+     * engine recursion; honest acquire only */
     do {
-        /* GAP-FILL(vs): plain loads/stores through type-punned pointers
-         * let the optimiser cache the lock word at -O1+ (infinite spin);
-         * atomic builtins keep the contract */
         while (__atomic_load_n(lp, __ATOMIC_ACQUIRE) != MTMTXINITVAL) {
             m_waitspin();
         }
@@ -91,7 +91,6 @@ mtlkfmtx(volatile m_atomic_t *lp)
 static INLINE void
 mtunlkfmtx(volatile m_atomic_t *lp)
 {
-    /* GAP-FILL(vs): release-store so the write is visible to spinners */
     __atomic_store_n(lp, (m_atomic_t)MTMTXINITVAL, __ATOMIC_RELEASE);
     m_endspin();
 

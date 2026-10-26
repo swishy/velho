@@ -9,3 +9,7 @@ mem		- memory management
 prof		- profiling routines
 tabhash		- cache-friendly hash table implementation
 
+Allocator contributors: read ../../../doc/allocator-design.md before changing
+mem.c, mem.h or the malloc shim. It records the bitmap/pointer representation,
+queue ownership and lifetime rules, lock ordering, and validation approach.
+

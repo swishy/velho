@@ -325,7 +325,7 @@ m_cmpsetbit64(volatile m_atomic_t *p, long ndx)
                               "jnc 1f\n"
                               "incq %1\n"
                               "1:\n"
-                              : "+m" (*(p)), "=r" (val)
+                              : "+m" (*(p)), "+r" (val)
                               : "i" (ndx)
                               : "cc", "memory");
     } else {
@@ -333,7 +333,7 @@ m_cmpsetbit64(volatile m_atomic_t *p, long ndx)
                               "jnc 1f\n"
                               "incq %1\n"
                               "1:\n"
-                              : "+m" (*(p)), "=r" (val)
+                              : "+m" (*(p)), "+r" (val)
                               : "r" (ndx)
                               : "cc", "memory");
     }
@@ -352,7 +352,7 @@ m_cmpclrbit64(volatile m_atomic_t *p, long ndx)
                               "jnc 1f\n"
                               "incq %1\n"
                               "1:\n"
-                              : "+m" (*(p)), "=r" (val)
+                              : "+m" (*(p)), "+r" (val)
                               : "i" (ndx)
                               : "cc", "memory");
     } else {
@@ -360,7 +360,7 @@ m_cmpclrbit64(volatile m_atomic_t *p, long ndx)
                               "jnc 1f\n"
                               "incq %1\n"
                               "1:\n"
-                              : "+m" (*(p)), "=r" (val)
+                              : "+m" (*(p)), "+r" (val)
                               : "r" (ndx)
                               : "cc", "memory");
     }
