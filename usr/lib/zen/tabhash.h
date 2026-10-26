@@ -59,7 +59,7 @@ tabhashputtab(TABHASH_TAB_T *tab)
     }
     tab->next = head;
     tab->prev = NULL;   /* GAP-FILL(vs): BUF-resident prev is meaningless */
-    m_atomwrite((m_atomic_t *)&TABHASH_BUF, tab);
+    mtunlkval((m_atomic_t *)&TABHASH_BUF, (m_atomic_t)head);
 
     return;
 }
@@ -84,7 +84,7 @@ tabhashgettab(void)
         /* allocate more subtables */
         if (ptr == MAP_FAILED) {
             tab = NULL;
-            mtunlkbit((m_atomic_t *)&TABHASH_BUF, MEM_LK_BIT_OFS);
+            mtunlkval((m_atomic_t *)&TABHASH_BUF, (m_atomic_t)head);
         } else {
             tab = (TABHASH_TAB_T *)ptr;         // first table
             ntab = TABHASH_CACHE_TABS - 1;
@@ -101,7 +101,7 @@ tabhashgettab(void)
             }
             /* queue newly-allocated chain of tables */
             prev->next = NULL;
-            m_atomwrite(&TABHASH_BUF, head);
+            mtunlkval((m_atomic_t *)&TABHASH_BUF, (m_atomic_t)head);
         }
     } else {
         /* remove head from queue */
@@ -109,7 +109,7 @@ tabhashgettab(void)
         if (head) {
             head->prev = NULL;
         }
-        m_atomwrite(&TABHASH_BUF, head);
+        mtunlkval((m_atomic_t *)&TABHASH_BUF, (m_atomic_t)head);
     }
     if (tab) {
         tab->nmax = TABHASH_TAB_ITEMS;
@@ -161,7 +161,7 @@ tabhashadd(TABHASH_TAB_T **hashtab, const uintptr_t key, const uintptr_t val)
     if (!stored) {
         tab = tabhashgettab();
         if (!tab) {
-            m_atomwrite((m_atomic_t *)&hashtab[slot], head);
+            mtunlkval((m_atomic_t *)&hashtab[slot], (m_atomic_t)head);   /* MT: paired unlock, store possibly-updated head */
 
             return 0;
         }
@@ -179,7 +179,7 @@ tabhashadd(TABHASH_TAB_T **hashtab, const uintptr_t key, const uintptr_t val)
             tab->prev = NULL;   /* GAP-FILL(vs): chain head owns no prev */
         }
     }
-    m_atomwrite((m_atomic_t *)&hashtab[slot], head);
+    mtunlkval((m_atomic_t *)&hashtab[slot], (m_atomic_t)head);   /* MT: paired unlock, store possibly-updated head */
 
     return 1;
 }
@@ -268,7 +268,7 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
                     }
                     head = tab;
                 }
-                m_atomwrite((m_atomic_t *)&hashtab[ndx], head);
+                mtunlkval((m_atomic_t *)&hashtab[ndx], (m_atomic_t)head);   /* MT: paired unlock */
 
                 return ret;
             }
@@ -277,7 +277,7 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
         prev = tab;
         tab = tab->next;
     }
-    m_atomwrite((m_atomic_t *)&hashtab[ndx], head);
+    mtunlkval((m_atomic_t *)&hashtab[ndx], (m_atomic_t)head);   /* MT: paired unlock */
 
     return ret;
 }

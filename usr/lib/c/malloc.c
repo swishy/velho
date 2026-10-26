@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
+#include <sched.h>
 #include <sys/types.h>
 
 #include <zero/cdefs.h>
@@ -64,7 +65,16 @@ shim_tls_init(void)
         tls->runtab[q].tls = tls;
     }
     m_membar();
-    t_memtls = tls;
+    /* MT: publish once via CAS - a racing loser keeps the winner's TLS
+     * and leaks its own (unused) copy rather than swapping a live one */
+    {
+        struct memtls *expect = NULL;
+        if (!__atomic_compare_exchange_n(&t_memtls, &expect, tls, 0,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            unmapanon(tls, sizeof(struct memtls));
+        }
+    }
 }
 
 static void
@@ -106,7 +116,6 @@ shim_memsize(void *ptr)
     long           type;
     size_t         sz = 0;
 
-    item = tabhashfind(g_memhashtab, mempageadr(ptr));
     if (item.page) {
         type = memhashtype(&item);
         if (type == MEM_BLK) {
