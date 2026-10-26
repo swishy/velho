@@ -367,6 +367,33 @@ memgetblk(unsigned long qid, size_t align, size_t *retsize)
     uintptr_t           page;
     uintptr_t           val;
 
+    /* locality: serve from the current buffer until exhausted (the raw
+     * LIFO scattered blocks across slabs - cache-miss storm) */
+    buf = t_memtls ? t_memtls->curblk[qid] : NULL;
+    if (buf && buf->ofs < buf->max && buf->adr
+        && buf->queue == &t_memtls->blktab[qid]) {
+        ptr = (int8_t *)buf->tab[buf->ofs];
+        buf->ofs++;
+        if (buf->ofs == buf->max) {
+            t_memtls->blktab[qid].nusable--;
+            t_memtls->curblk[qid] = NULL;
+        }
+        ret = memalignptr(ptr, align);
+        if (ret) {
+            size_t o2 = buf->max + memblknum(qid, buf, ret);
+            buf->tab[o2] = (uintptr_t)(ret - ptr);
+            { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_BLK);
+              uintptr_t vl = memsethashbuf(buf, qid, MEM_BLK);
+              if (!tabhashaddref(g_memhashtab, pg, vl)) {
+                  tabhashadd(g_memhashtab, pg, vl);
+              }
+              if (retsize) { *retsize = blksz; } }
+        }
+
+        return ret;
+    }
+    t_memtls->curblk[qid] = NULL;
+
     /* magazine fast path: pop the available-stack, validating entries
      * (stale entries - handed off, released, or re-exhausted - skip).
      * This replaces the queue walk, which was O(live buffers) per
@@ -400,6 +427,7 @@ memgetblk(unsigned long qid, size_t align, size_t *retsize)
             av->anext = NULL;
             av->availf = 0;
             buf = av;
+            t_memtls->curblk[qid] = buf;   /* locality: stick to it */
             ptr = (int8_t *)buf->tab[buf->ofs];
             buf->ofs++;
             if (buf->ofs == buf->max) {
@@ -576,6 +604,37 @@ memgetrun(unsigned long qid, size_t align, size_t *retsize)
     uintptr_t           val;
     uintptr_t           diff;
 
+    /* locality: serve from the current buffer until exhausted - the
+     * raw LIFO interleaved buffers and scattered runs across slabs
+     * (cache-miss storm: scan 52ms->4.4s). The avail-stack finds the
+     * NEXT buffer only when this one dies. */
+    buf = t_memtls ? t_memtls->currun[qid] : NULL;
+    if (buf && buf->bits && buf->adr
+        && buf->queue == &t_memtls->runtab[qid]) {
+        long b2 = buf->bits;
+        long o2 = m_ctz(b2);
+        ptr = buf->adr + ((o2 << PAGESIZELOG2) * qid);
+        buf->bits = b2 & ~(1L << o2);
+        if (!buf->bits) {
+            t_memtls->runtab[qid].nusable--;
+            t_memtls->currun[qid] = NULL;   /* exhausted - next pop */
+        }
+        ret = memalignptr(ptr, align);
+        if (ret) {
+            ofs = memrunnum(qid, buf, ret);
+            buf->tab[ofs] = (uintptr_t)(ret - ptr);
+            { uintptr_t pg = memsethashpage(mempageadr(ret), MEM_RUN);
+              uintptr_t vl = memsethashbuf(buf, qid, MEM_RUN);
+              if (!tabhashaddref(g_memhashtab, pg, vl)) {
+                  tabhashadd(g_memhashtab, pg, vl);
+              }
+              if (retsize) { *retsize = memrunsize(qid); } }
+        }
+
+        return ret;
+    }
+    t_memtls->currun[qid] = NULL;
+
     /* magazine fast path: pop the run available-stack (see memgetblk) */
     buf = NULL;
     if (t_memtls) {
@@ -604,6 +663,7 @@ memgetrun(unsigned long qid, size_t align, size_t *retsize)
             av->anext = NULL;
             av->availf = 0;
             buf = av;
+            t_memtls->currun[qid] = buf;   /* locality: stick to it */
             { long b2 = buf->bits;
               long o2 = m_ctz(b2);
               ptr = buf->adr + ((o2 << PAGESIZELOG2) * qid);
