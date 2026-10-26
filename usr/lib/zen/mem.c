@@ -291,10 +291,11 @@ retry:
         memqueuebuf(queue, buf);
         mtunlkfmtx(&queue->mtx);
     }
-    /* The take pairs with the release/seal transition under the queue
-     * lock: a foreign last-free may otherwise recycle the buffer's
-     * header between the head read and the take. Uncontended on the
-     * single-thread hot path. */
+    /* The take pairs with the free/release side under ONE hold of the
+     * queue lock: the head-usable invariant (a queued buffer always has
+     * capacity) is only released with the lock. Failed increments are
+     * undone before retry - a leaked overshoot drifts ofs past max and
+     * every later take misreads it as sealed (the 8-worker livelock). */
     mtlkfmtx(&queue->mtx);
     buf = queue->head;
     if (!buf) {
@@ -304,27 +305,20 @@ retry:
     if (type == MEM_BLK) {
         m_atomic_t old = __atomic_fetch_add(&buf->ofs, 1, __ATOMIC_ACQ_REL);
         if (old >= (m_atomic_t)buf->max) {
-            mtunlkfmtx(&queue->mtx);
-            if (old > (m_atomic_t)buf->max) {
-                __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
-                m_waitspin();       /* sealed mid-flight */
-                goto retry;
-            }
-            mtlkfmtx(&queue->mtx);
-            if (buf == queue->head) {
-                memdequebuf(queue, buf);   /* exhausted */
+            __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
+            if (old == (m_atomic_t)buf->max && buf == queue->head) {
+                memdequebuf(queue, buf);   /* exhausted: leave now */
             }
             mtunlkfmtx(&queue->mtx);
             goto retry;
         }
         ptr = (int8_t *)buf->tab[old];
+        mtunlkfmtx(&queue->mtx);
     } else {
         uintptr_t bits = __atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE);
         if (!bits || buf->ofs == MEM_SEALED) {
-            if (buf == queue->head
-                && (!__atomic_load_n(&buf->bits, __ATOMIC_ACQUIRE)
-                    || buf->ofs == MEM_SEALED)) {
-                memdequebuf(queue, buf);
+            if (buf == queue->head) {
+                memdequebuf(queue, buf);   /* exhausted or sealed */
             }
             mtunlkfmtx(&queue->mtx);
             goto retry;
@@ -341,8 +335,8 @@ retry:
         if (!next && buf == queue->head) {
             memdequebuf(queue, buf);       /* exhausted */
         }
+        mtunlkfmtx(&queue->mtx);
     }
-    mtunlkfmtx(&queue->mtx);
 
     /* Ordinary blocks/runs already satisfy the minimum alignment. */
     if (align > (type == MEM_BLK ? CLSIZE : PAGESIZE)) {
@@ -501,7 +495,8 @@ memput(void *ptr)
         size_t index = memblknum(qid, buf, ptr);
         m_atomic_t old = __atomic_fetch_sub(&buf->ofs, 1, __ATOMIC_ACQ_REL);
         buf->tab[old - 1] = (uintptr_t)buf->adr + index * memblksize(qid);
-        if (old == (m_atomic_t)buf->max) {
+        if (old == (m_atomic_t)buf->max
+            && queue->head != buf && !buf->prev && !buf->next) {
             memqueuebuf(queue, buf);       /* revival: exactly-once */
         }
         if (old == 1) {
@@ -512,7 +507,7 @@ memput(void *ptr)
         uintptr_t bit = (uintptr_t)1 << index;
         uintptr_t old = __atomic_fetch_or(&buf->bits, bit, __ATOMIC_ACQ_REL);
         uintptr_t full = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - buf->max);
-        if (!old) {
+        if (!old && queue->head != buf && !buf->prev && !buf->next) {
             memqueuebuf(queue, buf);       /* revival: exactly-once */
         }
         if ((old | bit) == full) {
