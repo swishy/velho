@@ -72,7 +72,10 @@ mtlkfmtx(volatile m_atomic_t *lp)
     m_atomic_t  res = 0;
 
     do {
-        while (*lp != MTMTXINITVAL) {
+        /* GAP-FILL(vs): plain loads/stores through type-punned pointers
+         * let the optimiser cache the lock word at -O1+ (infinite spin);
+         * atomic builtins keep the contract */
+        while (__atomic_load_n(lp, __ATOMIC_ACQUIRE) != MTMTXINITVAL) {
             m_waitspin();
         }
         res = m_cmpswap(lp, MTMTXINITVAL, MTMTXLKVAL);
@@ -88,9 +91,9 @@ mtlkfmtx(volatile m_atomic_t *lp)
 static INLINE void
 mtunlkfmtx(volatile m_atomic_t *lp)
 {
-    m_membar();         // full memory barrier
-    *lp = MTMTXINITVAL;  // lazy-write
-    m_endspin();        // signal wakeup-event
+    /* GAP-FILL(vs): release-store so the write is visible to spinners */
+    __atomic_store_n(lp, (m_atomic_t)MTMTXINITVAL, __ATOMIC_RELEASE);
+    m_endspin();
 
     return;
 }

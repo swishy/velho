@@ -20,19 +20,28 @@
 #include <mach/ppc/asm.h>
 #endif
 
-#define m_trylkbit(p, ndx) (!m_cmpsetbit(p, ndx))
-#define m_unlkbit(p, ndx)  m_clrbit(p, ndx)
+/* GAP-FILL(vs): the guard tested the POINTER value, not the lock word,
+ * and the bit ops were hand-rolled asm the optimiser was free to cache
+ * at -O1+ (eternal spin on an already-locked word). Atomic builtins. */
+#define m_trylkbit(p, ndx)                                              \
+    (!(__atomic_fetch_or((m_atomic_t *)(p), (m_atomic_t)1 << (ndx),     \
+                         __ATOMIC_ACQ_REL) & ((m_atomic_t)1 << (ndx))))
+#define m_unlkbit(p, ndx)                                               \
+    __atomic_and_fetch((m_atomic_t *)(p), ~((m_atomic_t)1 << (ndx)),    \
+                       __ATOMIC_RELEASE)
 #define m_lkbit(p, ndx)                                                 \
     do {                                                                \
-        long _pos = 1 << (ndx);                                         \
-        long _res = 0;                                                  \
+        m_atomic_t _bit = (m_atomic_t)1 << (ndx);                       \
+        m_atomic_t _old;                                                \
                                                                         \
-        do {                                                            \
-            while ((uintptr_t)(p) & _pos) {                             \
-                m_waitspin();                                           \
-            }                                                           \
-            _res = m_cmpsetbit((p), ndx);                               \
-        } while (!_res);                                                \
+        /* GAP-FILL(vs): the engine re-enters these locks on the same word
+         * within one thread (the original primitive never actually tested
+         * the word, so re-entrancy silently worked). Single-threaded
+         * semantics: RMW-acquire without self-spinning; a set bit is
+         * always our own hold. (Multi-threaded use needs the recursion
+         * untangled first - see FINDINGS.) */ \
+        _old = __atomic_fetch_or((m_atomic_t *)(p), _bit,               \
+                                 __ATOMIC_ACQ_REL);                     \
     } while (0)
 
 #endif /* __MACH_ASM_H__ */

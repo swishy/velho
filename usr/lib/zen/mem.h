@@ -6,6 +6,8 @@
 #include <mach/param.h>
 #include <mach/types.h>
 #include <mt/mtx.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <zero/trix.h>
 
 #define MEM_LK_BIT_OFS                  0
@@ -14,14 +16,21 @@
 #define memfreebuf(buf)                 unmapanon(buf->adr, buf->size)
 
 #define memhashpage(hash)               ((hash)->page & MEM_HASH_PAGE_MASK)
-#define memhashtype(hash)               ((hash)->val & MEM_TYPE_MASK)
+#define memhashtype(hash)               ((((hash)->val) >> MEM_BUF_QUEUE_BITS) \
+                                         & MEM_TYPE_MASK)
 #define memhashbuf(hash)                ((void *)((hash)->val           \
                                                   & MEM_BUF_ADR_MASK))
 #define memhashsize(hash)               ((hash)->val)
 #define memhashqid(hash)                ((hash)->val & MEM_BUF_QUEUE_MASK)
-#define memsethashpage(adr, type)       ((uintptr_t)(adr)               \
-                                         | ((type) << MEM_HASH_TYPE_SHIFT))
-#define memsethashbuf(buf, qid)         ((uintptr_t)(buf) | (qid))
+/* GAP-FILL(vs): the type used to live in the hash KEY (page|type<<shift)
+ * while every lookup hashed the raw page - BLK (type 0) agreed by
+ * accident, RUN/BIG entries landed in different buckets and could never
+ * be found or removed: an unbounded stale-entry factory. The key is now
+ * the raw page and the type rides in low bits of val, where the
+ * page-aligned buffer pointer leaves room (qid:8, type:2). */
+#define memsethashpage(adr, type)       ((uintptr_t)(adr))
+#define memsethashbuf(buf, qid, type)   ((uintptr_t)(buf) | (qid)        \
+                                         | ((type) << MEM_BUF_QUEUE_BITS))
 #define memsethashval(sz, cnt)          ((sz) | (cnt))
 
 #define MEM_ALIGN_MIN                   CLSIZE
@@ -32,7 +41,11 @@
 #define PTRALIGNED(ptr, aln)    (ptr)
 #endif
 
-#define mempageadr(adr)         ((uintptr_t)(adr) & (PAGESIZE - 1))
+/* GAP-FILL(vs): upstream masks with (PAGESIZE - 1) yielding a page *offset*;
+ * every consumer (the packed base|type|nref page-field layout documented
+ * below, TABHASH_CMP masking to the page base, memput/memgetptr keying on
+ * the raw page) requires the page *base* address. */
+#define mempageadr(adr)         ((uintptr_t)(adr) & ~(PAGESIZE - 1))
 #define memalignptr(ptr, aln)   ((void *)roundup2((uintptr_t)ptr, aln))
 
 #define MEM_BLK                 0
@@ -74,10 +87,13 @@
 #elif (MEM_BIG_QUEUES == 64)
 #define MEM_BIG_SHIFT           7
 #endif
+/* GAP-FILL(vs): <= lets a whole-page request become a BLK whose qid
+ * (PAGESIZE >> CLSIZELOG2) overruns the MEM_BLK_QUEUES table; a page
+ * belongs to the run allocator */
 #define membuftype(sz)                                                  \
-    (((sz) <= MEM_BLK_MAX)                                              \
+    ((((((sz) + MEM_BLK_MIN - 1) >> CLSIZELOG2)) < MEM_BLK_QUEUES)      \
      ? MEM_BLK                                                          \
-     : (((sz) <= MEM_RUN_MAX)                                           \
+     : ((((((sz) + PAGESIZE - 1) >> PAGESIZELOG2)) < MEM_RUN_QUEUES)     \
         ? MEM_RUN                                                       \
         : MEM_BIG))
 #define memblkqid(sz)           (((sz) + MEM_BLK_MIN - 1) >> CLSIZELOG2)
@@ -88,13 +104,16 @@
                                  >> (PAGESIZELOG2 + MEM_BIG_SHIFT))
 #define membigsize(qid)         (MEM_BIG_UNIT * (qid))
 #define memnblk(qid)            (g_mem.nblktab[(qid)])
+/* GAP-FILL(vs): the 1/blksz double strength-reduction truncates e.g.
+ * 12.9999... to 12 for some size classes, mis-decoding block indices;
+ * round to nearest instead */
 #define memblknum(qid, buf, ptr)                                        \
     ((long)(((uintptr_t)(ptr) - (uintptr_t)((buf)->adr))                \
-            * g_mem.blkdivtab[(qid)]))
+            * g_mem.blkdivtab[(qid)] + 0.5))
 #define memnrun(qid)            (g_mem.nruntab[(qid)])
 #define memrunnum(qid, buf, ptr)                                        \
     ((long)(((uintptr_t)(ptr) - (uintptr_t)((buf)->adr))                \
-            * g_mem.rundivtab[(qid)]))
+            * g_mem.rundivtab[(qid)] + 0.5))   /* GAP-FILL(vs): see memblknum */
 #define memnblktlsbuf(qid)                                              \
     (((qid) <= MEM_BLK_MID_QUEUE_MIN)                                   \
      ? 4                                                                \
@@ -273,7 +292,10 @@ void  * memresize(void *ptr, size_t size, size_t align, long flg);
  */
 /* page-member */
 #define MEM_HASH_NREF_BITS              (PAGESIZELOG2 - MEM_TYPE_BITS)
-#define MEM_HASH_NREF_MASK              ((1U << MEM_HASH_NREF_BITS) - 1)
+/* GAP-FILL(vs): 1U makes ~mask ZERO-extend, so nref clear-then-set
+ * truncated the page word's high 32 bits (entries silently unfindable
+ * after the first reference count write) */
+#define MEM_HASH_NREF_MASK              (((uintptr_t)1 << MEM_HASH_NREF_BITS) - 1)
 #define MEM_HASH_TYPE_SHIFT             MEM_HASH_NREF_BITS
 #define MEM_HASH_TYPE_MASK              (MEM_TYPE_MASK << MEM_HASH_TYPE_SHIFT)
 #define MEM_HASH_TYPE_BLK               (MEM_BLK << MEM_HASH_TYPE_SHIFT)
@@ -282,7 +304,7 @@ void  * memresize(void *ptr, size_t size, size_t align, long flg);
 #define MEM_PAGE_PTR_BITS               (PTRBITS - PAGESIZELOG2)
 #define MEM_HASH_PAGE_MASK              (~(PAGESIZE - 1))
 /* val-member */
-#define MEM_BUF_ADR_MASK                (~MEM_BUF_QUEUE_MASK)
+#define MEM_BUF_ADR_MASK                (~(((uintptr_t)1 << (MEM_BUF_QUEUE_BITS + MEM_TYPE_BITS)) - 1))
 #define MEM_BUF_ADR_BITS                (ADRBITS - MEM_BUF_QUEUE_BITS - MEM_BUF_ALN_BITS - 1)
 #define MEM_BUF_QUEUE_MASK              (((uintptr_t)1 << MEM_BUF_QUEUE_BITS) \
                                          - 1)
@@ -309,12 +331,18 @@ struct memhash {
 #define TABHASH_TAB_ITEMS       ((64 - TABHASH_HDR_WORDS) / TABHASH_ITEM_WORDS)
 #define TABHASH_KEY(item)       ((item)->page)
 #if (WORDSIZE == 8)
-#define TABHASH_HASH(key)       tmhash64(key)
+/* GAP-FILL(vs): slot-mask the 64-bit hash or hashtab[] is indexed
+ * out of bounds; upstream vnd config never landed this */
+#define TABHASH_HASH(key)       (tmhash64(key) & (TABHASH_SLOTS - 1))
 #define TABHASH_HASH_ITEM(item) TABHASH_HASH((item)->page)
 #else
 #define TABHASH_HASH_ITEM(item) tmhash32((item)->page)
 #endif
-#define TABHASH_CMP(item, key)  (memhashpage(item) == key)
+/* GAP-FILL(vs): THE original sin - the comparator returned TRUE on match
+ * while every scan acts on !CMP (nonzero = mismatch, memcmp-style); with
+ * == the scans skipped real matches and processed the first wrong item,
+ * returning garbage and mangling tables wholesale. */
+#define TABHASH_CMP(item, key)  (memhashpage(item) != (key))
 #define TABHASH_COPY(src, dest) (*(dest) = *(src))
 #define TABHASH_GET_NREF(item)  ((item)->page & MEM_HASH_NREF_MASK)
 #define TABHASH_PUT_NREF(item, n)                                       \
@@ -368,13 +396,20 @@ memgetptr(void *ptr)
     long                mask;
     uintptr_t           num;
 
+    if (UNLIKELY((uintptr_t)ptr < (uintptr_t)buf->adr
+                 || (uintptr_t)ptr >= (uintptr_t)buf->adr + buf->size)) {
+        /* stale second lookup - the block is not from this buffer */
+        return NULL;
+    }
     mtlkfmtx(&buf->queue->mtx);
     switch (type) {
         case MEM_BLK:
             ofs = buf->max;
             num = memblknum(qid, buf, ptr);
             ofs += num;
-            adr = (int8_t *)buf->tab[ofs];
+            /* GAP-FILL(vs): tab[ofs] holds the alignment *delta* stored at
+             * allocation; the original block address is ptr - delta */
+            adr = (int8_t *)((uintptr_t)ptr - buf->tab[ofs]);
 
             break;
         case MEM_RUN:
@@ -382,7 +417,7 @@ memgetptr(void *ptr)
             num = memrunnum(qid, buf, ptr);
             bits = buf->bits;
             mask <<= num;
-            adr = (int8_t *)buf->tab[num];
+            adr = (int8_t *)((uintptr_t)ptr - buf->tab[num]);
             bits |= mask;
             buf->bits = bits;
 

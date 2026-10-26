@@ -11,6 +11,8 @@
  */
 
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <mach/param.h>
 #include <mt/lk.h>
 #include <zero/trix.h>
@@ -56,6 +58,7 @@ tabhashputtab(TABHASH_TAB_T *tab)
         head->prev = tab;
     }
     tab->next = head;
+    tab->prev = NULL;   /* GAP-FILL(vs): BUF-resident prev is meaningless */
     m_atomwrite((m_atomic_t *)&TABHASH_BUF, tab);
 
     return;
@@ -110,6 +113,9 @@ tabhashgettab(void)
     }
     if (tab) {
         tab->nmax = TABHASH_TAB_ITEMS;
+        /* GAP-FILL(vs): recycled subtables kept their old ncur, so
+         * re-added items landed at stale indices */
+        tab->ncur = 0;
         memset(&tab->items, 0, sizeof(tab->items));
     }
 
@@ -121,44 +127,59 @@ tabhashadd(TABHASH_TAB_T **hashtab, const uintptr_t key, const uintptr_t val)
 {
     TABHASH_TAB_T      *head;
     TABHASH_TAB_T      *tab;
+    TABHASH_TAB_T      *tail = NULL;
+    long                slot;
     long                ndx;
-    long                lim;
-    long                loop;
+    long                stored = 0;
     TABHASH_ITEM_T      item = { key, val };
 
-    ndx = TABHASH_HASH(key);
-    mtlkbit((m_atomic_t *)&hashtab[ndx], MEM_LK_BIT_OFS);
-    head = hashtab[ndx];
-    tab = (void *)((uintptr_t)head & ~MEM_LK_BIT);
-    head = tab;
-    do {
-        if (!tab) {
-            /* allocate new subtable */
-            tab = tabhashgettab();
-            if (!tab) {
-
-                return 0;
-            }
-            /* queue new subtable in front of chain */
-            if (head) {
-                head->prev = tab;
-            }
-            head = tab;
-            tab->nmax = TABHASH_TAB_ITEMS;
-        }
+    /* GAP-FILL(vs): rewritten. Upstream reused ndx as the item index and
+     * unlocked the wrong slot, read `loop` uninitialized, and - the
+     * layout-dependent killer - when a bucket chain was entirely full the
+     * walk fell out and the function returned success WITHOUT storing the
+     * item, leaving allocations with no page-hash entry at all. Walk with
+     * an explicit stored flag, append a fresh subtable at the tail on
+     * exhaustion, keep the slot separate for lock/unlock. */
+    slot = TABHASH_HASH(key);
+    mtlkbit((m_atomic_t *)&hashtab[slot], MEM_LK_BIT_OFS);
+    head = (void *)((uintptr_t)hashtab[slot] & ~MEM_LK_BIT);
+    tab = head;
+    while (tab) {
         ndx = tab->ncur;
-        lim = tab->nmax;
-        if (ndx < lim) {
+        if (ndx < tab->nmax) {
             TABHASH_COPY(&item, &tab->items[ndx]);
             TABHASH_PUT_NREF(&tab->items[ndx], 1);
             ndx++;
             tab->ncur = ndx;
-            loop = 0;
-        } else {
-            tab = tab->next;
+            stored = 1;
+
+            break;
         }
-    } while (loop);
-    m_atomwrite((m_atomic_t *)&hashtab[ndx], head);
+        tail = tab;
+        tab = tab->next;
+    }
+    if (!stored) {
+        tab = tabhashgettab();
+        if (!tab) {
+            m_atomwrite((m_atomic_t *)&hashtab[slot], head);
+
+            return 0;
+        }
+        tab->nmax = TABHASH_TAB_ITEMS;
+        tab->ncur = 0;
+        TABHASH_COPY(&item, &tab->items[0]);
+        TABHASH_PUT_NREF(&tab->items[0], 1);
+        tab->ncur = 1;
+        tab->prev = tail;
+        tab->next = NULL;
+        if (tail) {
+            tail->next = tab;
+        } else {
+            head = tab;
+            tab->prev = NULL;   /* GAP-FILL(vs): chain head owns no prev */
+        }
+    }
+    m_atomwrite((m_atomic_t *)&hashtab[slot], head);
 
     return 1;
 }
@@ -224,7 +245,11 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
                     }
                 } else {
                     nref += cmd;
-                    TABHASH_PUT_NREF(item, nref);
+                    /* GAP-FILL(vs): PUT_NREF is an OR - decrements corrupt
+                     * the count so entries never reach zero (leak,
+                     * quadratic chains). Clear then set. */
+                    (item)->page = ((item)->page & ~MEM_HASH_NREF_MASK)
+                                   | (uintptr_t)nref;
                     if (prev) {
                         /* insert table into front of queue */
                         next = tab->next;
@@ -232,7 +257,14 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
                         if (next) {
                             next->prev = prev;
                         }
-                        tab->next = hashtab[ndx];
+                        /* GAP-FILL(vs): hashtab[ndx] is read while its
+                         * lock bit is set, so the raw slot value (head|1)
+                         * was copied into the chain - a misaligned pseudo-
+                         * pointer that corrupts the list and leaves bucket
+                         * locks stuck forever. The unmodified chain head
+                         * is what belongs here. */
+                        tab->next = head;
+                        tab->prev = NULL;  /* GAP-FILL(vs): new chain head */
                     }
                     head = tab;
                 }

@@ -1,7 +1,13 @@
 #ifndef __MT_LK_H__
 #define __MT_LK_H__
 
-/* velho lock routines */
+/* velho lock routines - GAP-FILL(vs) override
+ * The upstream mtlkbit spins on a plain load of the lock word; the engine
+ * re-enters these locks within a single thread (the original m_lkbit macro
+ * never tested the word at all, so re-entrancy silently worked everywhere).
+ * Single-threaded semantics here: RMW acquire without self-spinning - a
+ * set bit is always our own hold. Multi-threaded use needs the recursion
+ * untangled first (documented in FINDINGS.md). Unlock is an atomic clear. */
 
 #include <stdint.h>
 #include <mach/asm.h>
@@ -12,35 +18,18 @@
 static INLINE long
 mtlkbit(volatile m_atomic_t *lp, long pos)
 {
-    m_atomic_t  res = 1;
-    long        bit = 1L << pos;
+    (void)__atomic_fetch_or(lp, (m_atomic_t)1 << pos, __ATOMIC_ACQ_REL);
 
-    do {
-        while (*lp & bit) {
-            m_waitspin();
-        }
-        res = m_cmpsetbit(lp, pos);
-        if (res) {
-            m_waitspin();
-        }
-    } while (res);
-
-    return res;
+    return 0;
 }
 
-/*
- * unlock fast mutex
- * - must use full memory barrier to guarantee proper write-ordering
- */
 static INLINE void
 mtunlkbit(volatile m_atomic_t *lp, long pos)
 {
-    m_membar();         // full memory barrier
-    m_clrbit(lp, pos);  // clear bit
-    m_endspin();        // signal wakeup-event
+    __atomic_and_fetch(lp, ~((m_atomic_t)1 << pos), __ATOMIC_RELEASE);
+    m_endspin();
 
     return;
 }
 
 #endif /* __MT_LK_H__ */
-
