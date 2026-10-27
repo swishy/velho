@@ -9,7 +9,10 @@ commit separately.
 
 The checked-in [test runner](../usr/lib/c/test-malloc.sh) runs hash sharing and
 recycling, all eight allocator stress stages, alignment/capacity/realloc checks,
-eight-thread churn, cross-thread frees and parked-owner frees. It also preloads
+eight-thread churn, cross-thread frees, parked-owner frees and the transition
+from pre-thread allocations to concurrent owner reuse and remote frees. A
+locked-payload test checks that optional reclamation failure preserves errno;
+it reports a skip when the runner cannot use `mlock`. It also preloads
 the library into the system Perl for a 30,000-entry churn smoke test. Each stress
 process has a timeout; any failure fails the job. This smoke test is distinct
 from the 237-file source-built Perl core subset recorded in the adoption report.

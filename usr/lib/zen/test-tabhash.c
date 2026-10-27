@@ -4,9 +4,31 @@
 #include <stdlib.h>
 #include <zen/_hash.h>
 #include <zen/mem.h>
+
+/* Standalone configuration for the general tabhash utility. The allocator
+ * derives ownership from aligned addresses and does not use this table. */
+struct memhash { uintptr_t page, val; };
+#define MEM_HASH_NREF_MASK (((uintptr_t)1 << (PAGESIZELOG2 - 2)) - 1)
+#define memhashpage(item) ((item)->page & ~(uintptr_t)(PAGESIZE - 1))
+#define TABHASH_SLOTS 16384
+#define TABHASH_INVALID { 0, 0 }
+#define TABHASH_BUF g_memhashbuf
+#define TABHASH_TAB_T struct tabhashtab
+#define TABHASH_ITEM_T struct memhash
+#define TABHASH_TAB_ITEMS 30
+#if WORDSIZE == 8
+#define TABHASH_HASH(key) (tmhash64(key) & (TABHASH_SLOTS - 1))
+#else
+#define TABHASH_HASH(key) (tmhash32(key) & (TABHASH_SLOTS - 1))
+#endif
+#define TABHASH_CMP(item, key) (memhashpage(item) != (key))
+#define TABHASH_COPY(src, dst) (*(dst) = *(src))
+#define TABHASH_GET_NREF(item) ((item)->page & MEM_HASH_NREF_MASK)
+#define TABHASH_PUT_NREF(item, n) ((item)->page |= (n))
+#define TABHASH_CHK(item) ((item)->page && (item)->val)
+#include <zen/tabhash.h>
 struct tabhashtab *g_memhashtab[TABHASH_SLOTS];
 struct tabhashtab *g_memhashbuf;
-struct memglob g_mem;
 
 int main(void)
 {

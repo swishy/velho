@@ -13,10 +13,16 @@ int main(void)
     size_t capacity[N];
     /* Fill the entire reported capacity, with many simultaneous live
      * allocations, to expose overlap and overreported usable sizes. */
-    for (size_t align = 64; align <= 1048576; align *= 2) {
+    for (size_t align = 16; align <= 1048576; align *= 2) {
         for (unsigned round = 0; round < 4; ++round) {
             for (unsigned i = 0; i < N; ++i) {
-                size_t size = 1 + ((i * 131 + round * 37) % 9000);
+                static const size_t edges[] = {
+                    4095, 4096, 4097, 65535, 65536, 65537,
+                    258047, 258048, 258049, 262143, 262144, 262145
+                };
+                size_t size = round == 3
+                    ? edges[i % (sizeof(edges) / sizeof(edges[0]))]
+                    : 1 + ((i * 131 + round * 37) % 9000);
                 assert(posix_memalign((void **)&p[i], align, size) == 0);
                 assert(((uintptr_t)p[i] & (align - 1)) == 0);
                 capacity[i] = malloc_usable_size(p[i]);

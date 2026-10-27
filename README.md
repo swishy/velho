@@ -6,7 +6,8 @@ Welcome to the Velho project.
 For the restored Zen allocator and malloc interposer, read the
 [allocator design and maintenance notes](doc/allocator-design.md) before
 changing allocation, locking or metadata handling. They describe the current
-bitmap/pointer approach, ownership invariants and validation requirements.
+address-derived ownership, bitmap approach, lifetime invariants and validation
+requirements.
 The [allocator CI and release guide](doc/allocator-ci.md) explains automated
 tests and the malloc library releases published from successful `main` pushes.
 

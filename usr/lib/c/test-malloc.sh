@@ -13,6 +13,8 @@ timeout -k 5s 90s env LD_PRELOAD="$out/libvelhomalloc.so" \
 timeout -k 5s 90s "$out/malloc-mtstress"
 timeout -k 5s 90s "$out/malloc-xfree-mt"
 timeout -k 5s 90s "$out/malloc-parked-test"
+timeout -k 5s 90s "$out/malloc-transition-test"
+timeout -k 5s 90s "$out/malloc-errno-test"
 # Exercise a real consumer as well as the C tests. This is a smoke test,
 # not the separate source-built Perl core harness or a performance gate.
 timeout -k 5s 90s env LD_PRELOAD="$out/libvelhomalloc.so" \

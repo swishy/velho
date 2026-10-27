@@ -11,7 +11,7 @@
 #include <sys/types.h>
 
 #include <zero/cdefs.h>
-#include <zen/_hash.h>
+#include <zen/sys/unix.h>
 #include <zen/mem.h>
 
 /* ------------------------------------------------------------------ */
@@ -30,10 +30,10 @@ shim_tls_init(void)
         return;
     }
     for (q = 0; q < MEM_BLK_QUEUES; q++) {
-        tls->blktab[q].qid = q;
+        tls->blktab[q].size = memblksize(q);
     }
     for (q = 0; q < MEM_RUN_QUEUES; q++) {
-        tls->runtab[q].qid = q;
+        tls->runtab[q].size = memrunsize(q);
     }
     t_memtls = tls;
 }
@@ -64,28 +64,12 @@ shim_constructor(void)
 static size_t
 shim_memsize(void *ptr)
 {
-    TABHASH_ITEM_T item;
-    long           type;
-    size_t         sz = 0;
-
-    item = tabhashfind(g_memhashtab, mempageadr(ptr));
-    if (item.page) {
-        type = memhashtype(&item);
-        if (type == MEM_BLK) {
-            sz = memblksize(memhashqid(&item));
-        } else if (type == MEM_RUN) {
-            sz = memrunsize(memhashqid(&item));
-        } else if (type == MEM_BIG) {
-            /* Mapping length plus type tag; length is a page multiple. */
-            sz = (size_t)(item.val & ~(uintptr_t)(PAGESIZE - 1));
-        }
-        if (type == MEM_BLK || type == MEM_RUN) {
-            struct membuf *buf = memhashbuf(&item);
-            sz -= ((uintptr_t)ptr - (uintptr_t)buf->adr) % sz;
-        }
+    struct membuf *buf = memptrbuf(ptr);
+    if (!buf->queue) {
+        return buf->size - ((uintptr_t)ptr - (uintptr_t)buf);
     }
-
-    return sz;
+    size_t size = buf->queue->size;
+    return size - ((uintptr_t)ptr - (uintptr_t)buf->adr) % size;
 }
 
 /* ------------------------------------------------------------------ */
