@@ -1,7 +1,9 @@
 # Velho Project README File
   ---
 
-Welcome to the Velho project.
+Welcome to the Velho project. 
+
+This fork attempts to due justice to the work of Tuomo Vendu Venäläinen (vendu) 
 
 For the restored Zen allocator and malloc interposer, read the
 [allocator design and maintenance notes](doc/allocator-design.md) before
@@ -12,6 +14,9 @@ The [allocator CI and release guide](doc/allocator-ci.md) explains automated
 tests and the malloc library releases published from successful `main` pushes.
 The [performance guide](doc/allocator-performance.md) records current results,
 their limits and reproduction commands.
+
+---- Original Narrative ----
+
 
 I started Velho to grab together my earlier code, mostly the better parts mostly
 from
