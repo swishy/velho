@@ -1,0 +1,272 @@
+[
+  {
+    "round": 1,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.2597108379704878,
+    "maxrss_kib": 4748,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 1,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.2678862669854425,
+    "maxrss_kib": 48684,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 1,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.2726415579672903,
+    "maxrss_kib": 48488,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 2,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.30827786901500076,
+    "maxrss_kib": 51372,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 2,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.2434394329902716,
+    "maxrss_kib": 48172,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 2,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.23938868200639263,
+    "maxrss_kib": 4744,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 3,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.22549318202072755,
+    "maxrss_kib": 48044,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 3,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.24308923800708726,
+    "maxrss_kib": 4620,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 3,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.2314187940210104,
+    "maxrss_kib": 47916,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 4,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.24292711698217317,
+    "maxrss_kib": 4748,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 4,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.2178439759882167,
+    "maxrss_kib": 48556,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 4,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.22942672698991373,
+    "maxrss_kib": 48428,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 5,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.23214535298757255,
+    "maxrss_kib": 48684,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 5,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.24082192702917382,
+    "maxrss_kib": 47532,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 5,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.2433596249902621,
+    "maxrss_kib": 4748,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 6,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.2339648679480888,
+    "maxrss_kib": 48940,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 6,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.2548388270079158,
+    "maxrss_kib": 4616,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 6,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.25857821898534894,
+    "maxrss_kib": 48556,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 7,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.24579940002877265,
+    "maxrss_kib": 4748,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 7,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.256117787968833,
+    "maxrss_kib": 48548,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 7,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.24256469699321315,
+    "maxrss_kib": 49196,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 8,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.2301290800096467,
+    "maxrss_kib": 48040,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 8,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.23089275701204315,
+    "maxrss_kib": 48684,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 8,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.23950822598999366,
+    "maxrss_kib": 4748,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 9,
+    "allocator": "cleanup",
+    "library": "/tmp/velho-tidy-20261028/O2/libvelhomalloc.so",
+    "seconds": 0.21845630899770185,
+    "maxrss_kib": 47916,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 9,
+    "allocator": "glibc",
+    "library": "",
+    "seconds": 0.2362397310207598,
+    "maxrss_kib": 4744,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  },
+  {
+    "round": 9,
+    "allocator": "before",
+    "library": "/tmp/velho-tidy-20261028/before.so",
+    "seconds": 0.24437262798892334,
+    "maxrss_kib": 48172,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": ""
+  }
+]

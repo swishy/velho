@@ -9,10 +9,20 @@ commit separately.
 
 The checked-in [test runner](../usr/lib/c/test-malloc.sh) runs hash sharing and
 recycling, all eight allocator stress stages, alignment/capacity/realloc checks,
-eight-thread churn, cross-thread frees and parked-owner frees. It also preloads
-the library into the system Perl for a 30,000-entry churn smoke test. Each stress
-process has a timeout; any failure fails the job. This smoke test is distinct
-from the 237-file source-built Perl core subset recorded in the adoption report.
+eight-thread churn, cross-thread frees, parked-owner frees and the transition
+from pre-thread allocations to concurrent owner reuse and remote frees. A
+locked-payload test checks that optional reclamation failure preserves errno
+after the allocating thread exits; it reports a skip when the runner cannot use
+`mlock`. A slab-race test keeps owner payloads live and reusable while a peer
+frees its earlier allocations. Thread exit also exercises cache retirement and
+late cross-thread frees. The runner also preloads
+the library into the system Perl for a 30,000-entry single-thread churn smoke
+test and a four-worker ithreads test with 3,000 entries per worker. The latter
+holds interleaved objects live, frees half, refills those holes, then destroys
+payloads and joins workers; it checks payload integrity throughout. Each stress
+process has a timeout; any failure fails the job. These smoke tests are distinct
+from the full source-built Perl core harness recorded in the
+[performance and validation guide](allocator-performance.md).
 CI does not enforce wall-clock performance thresholds on shared runners.
 
 After **all three matrix jobs succeed**, a push to `main` publishes a GitHub
@@ -39,7 +49,8 @@ and `Allocator O3` as required status checks in the main branch's ruleset after
 their first GitHub run. A workflow file alone does not configure branch rules.
 
 Local reproduction requires a Linux x86-64 C toolchain, pthreads, GNU `timeout`
-and Perl with `Time::HiRes` (available in the CI image):
+and Perl built with ithreads, `threads::shared` and `Time::HiRes` (available in
+the CI image):
 
 ```sh
 usr/lib/c/build-malloc.sh /tmp/velho-malloc-build -O2

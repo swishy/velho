@@ -1,5 +1,5 @@
 /* malloc(3) interposer for vendu's zen allocator.
- * The engine owns slabs, size-class queues and packed page metadata;
+ * The engine owns aligned slabs, size-class queues and allocation bitmaps;
  * this shim supplies process/TLS initialization and libc entry points.
  * Usable capacity is decoded from the same metadata as the free path.
  */
@@ -9,14 +9,32 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 #include <zero/cdefs.h>
-#include <zen/_hash.h>
+#include <zen/sys/unix.h>
 #include <zen/mem.h>
 
 /* ------------------------------------------------------------------ */
 /* TLS + global init                                                   */
 /* ------------------------------------------------------------------ */
+
+static pthread_key_t shim_tls_key;
+static pthread_once_t shim_tls_once = PTHREAD_ONCE_INIT;
+static int shim_tls_key_ready;
+
+static void
+shim_tls_exit(void *ptr)
+{
+    t_memtls = NULL;
+    memretire(ptr);
+}
+
+static void
+shim_tls_key_init(void)
+{
+    shim_tls_key_ready = pthread_key_create(&shim_tls_key, shim_tls_exit) == 0;
+}
 
 static void
 shim_tls_init(void)
@@ -30,22 +48,29 @@ shim_tls_init(void)
         return;
     }
     for (q = 0; q < MEM_BLK_QUEUES; q++) {
-        tls->blktab[q].qid = q;
+        tls->blktab[q].size = memblksize(q);
     }
     for (q = 0; q < MEM_RUN_QUEUES; q++) {
-        tls->runtab[q].qid = q;
+        tls->runtab[q].size = memrunsize(q);
     }
     t_memtls = tls;
+    /* Publish TLS first: pthread key setup may itself allocate. Failure to
+     * register only forfeits exit reclamation; it cannot corrupt another key. */
+    pthread_once(&shim_tls_once, shim_tls_key_init);
+    if (shim_tls_key_ready) {
+        pthread_setspecific(shim_tls_key, tls);
+    }
 }
 
 static void
 shim_init(void)
 {
-    /* Also handles allocations made before the constructor runs. */
-    if (!(__atomic_load_n(&g_mem.flg, __ATOMIC_ACQUIRE) & MEM_INIT_BIT)) {
-        meminit(&g_mem);
-    }
+    /* Published TLS proves global initialization has already completed.
+     * This also handles allocations before the constructor runs. */
     if (!t_memtls) {
+        if (!(__atomic_load_n(&g_mem.flg, __ATOMIC_ACQUIRE) & MEM_INIT_BIT)) {
+            meminit(&g_mem);
+        }
         shim_tls_init();
     }
 }
@@ -58,52 +83,30 @@ shim_constructor(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* size lookup - the memsize() upstream stubbed out                    */
+/* Usable capacity from the same slab geometry as free.                 */
 /* ------------------------------------------------------------------ */
 
 static size_t
 shim_memsize(void *ptr)
 {
-    TABHASH_ITEM_T item;
-    long           type;
-    size_t         sz = 0;
-
-    item = tabhashfind(g_memhashtab, mempageadr(ptr));
-    if (item.page) {
-        type = memhashtype(&item);
-        if (type == MEM_BLK) {
-            sz = memblksize(memhashqid(&item));
-        } else if (type == MEM_RUN) {
-            sz = memrunsize(memhashqid(&item));
-        } else if (type == MEM_BIG) {
-            /* Mapping length plus type tag; length is a page multiple. */
-            sz = (size_t)(item.val & ~(uintptr_t)(PAGESIZE - 1));
-        }
-        if (type == MEM_BLK || type == MEM_RUN) {
-            struct membuf *buf = memhashbuf(&item);
-            sz -= ((uintptr_t)ptr - (uintptr_t)buf->adr) % sz;
-        }
+    struct membuf *buf = memptrbuf(ptr);
+    if (!buf->queue) {
+        return buf->size - ((uintptr_t)ptr - (uintptr_t)buf);
     }
-
-    return sz;
+    size_t size = buf->queue->size;
+    return size - ((uintptr_t)ptr - (uintptr_t)buf->adr) % size;
 }
 
 /* ------------------------------------------------------------------ */
 /* malloc(3) API                                                       */
 /* ------------------------------------------------------------------ */
 
-
 void *
 malloc(size_t size)
 {
-    void *p;
-
     shim_init();
-    p = memget(size, 0, NULL);
-
-    return p;
+    return memget(size, 0, NULL);
 }
-
 
 void
 free(void *ptr)
@@ -119,10 +122,10 @@ calloc(size_t n, size_t size)
     size_t blksz = n * size;
     void *ptr;
 
-    shim_init();
     if (blksz == 0 || blksz / n != size) {
         return NULL;                    /* overflow or zero */
     }
+    shim_init();
     ptr = memget(blksz, 0, NULL);
     if (ptr) {
         memset(ptr, 0, blksz);
@@ -147,9 +150,8 @@ realloc(void *ptr, size_t size)
     size_t oldsz;
     void  *adr;
 
-    shim_init();
     if (!ptr) {
-
+        shim_init();
         return memget(size, 0, NULL);
     }
     if (!size) {
@@ -158,18 +160,13 @@ realloc(void *ptr, size_t size)
         return NULL;
     }
     oldsz = shim_memsize(ptr);
-    if (!oldsz) {
-        /* unknown to us - should not happen; leak rather than corrupt */
-        errno = ENOMEM;
-
-        return NULL;
-    }
     if (oldsz >= size) {
         return ptr;                     /* fits: keep in place */
     }
+    shim_init();
     adr = memget(size, 0, NULL);
     if (adr) {
-        memcpy(adr, ptr, oldsz < size ? oldsz : size);
+        memcpy(adr, ptr, oldsz);
         memput(ptr);
     }
 
@@ -189,10 +186,10 @@ posix_memalign(void **memptr, size_t align, size_t size)
 {
     void *ptr;
 
-    shim_init();
     if (align < sizeof(void *) || (align & (align - 1))) {
         return EINVAL;
     }
+    shim_init();
     ptr = memget(size, align, NULL);
     if (!ptr) {
         return ENOMEM;
@@ -205,10 +202,10 @@ posix_memalign(void **memptr, size_t align, size_t size)
 void *
 memalign(size_t align, size_t size)
 {
-    shim_init();
     if (!align || (align & (align - 1))) {
         return NULL;
     }
+    shim_init();
 
     return memget(size, align, NULL);
 }

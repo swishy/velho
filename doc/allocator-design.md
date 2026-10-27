@@ -1,118 +1,174 @@
 # Zen allocator design and maintenance
 
-This is the current design of `usr/lib/zen/mem.c`, `usr/lib/zen/mem.h` and the
-libc interposer in `usr/lib/c/malloc.c`. Read it before changing these paths.
-The dated review and benchmark reports record experiments; this document
-describes the maintained approach.
-
-[CI and release documentation](allocator-ci.md) describes the automated checks,
-commit-specific main releases and local test runner.
+This describes the maintained implementation in `usr/lib/zen/mem.c`,
+`usr/lib/zen/mem.h` and `usr/lib/c/malloc.c`. Read it before changing allocation,
+free, alignment or ownership handling. See [CI and releases](allocator-ci.md)
+for automated checks and [performance](allocator-performance.md) for the current
+measurements and reproduction commands.
 
 The working mandate is concise pointer/bit arithmetic, little metadata and
-minimal work per allocation. This follows the project's reconstruction of
-Vendu's intentions; it is not a recovered original specification. Prefer
-removing redundant work and deriving state from existing words. Introduce
-additional state only for a demonstrated requirement, with its ownership and
-lifetime explained.
+minimal work per allocation. It follows the project's reconstruction of Vendu's
+intentions, not a recovered original specification. Prefer deriving state from
+addresses and existing ownership. Add state for a demonstrated cost or invariant,
+and explain its lifetime. Keep independently measurable changes reviewable.
+Vendu's [original allocator sketch](../usr/lib/c/malloc.txt) is retained as
+background; its proposed internal API is historical.
 
-## Allocation representation
+## Ownership is encoded by alignment
 
-BLK and RUN slabs use one `uintptr_t` bitmap. A set bit means a free slot;
-a clear bit means an allocation is outstanding. Allocation selects `ctz(bits)`
-and clears that bit. Free derives the slot by flooring the returned pointer's
-displacement from the slab base by the class stride, then sets its bit.
-An explicitly aligned pointer remains inside its original slot; usable size
-subtracts that displacement. There is no per-allocation header or delta table.
+Regular slabs are power-of-two aligned mappings, **256 KiB on the tested x86-64
+configuration**. Each slab contains its own header and allocation bitmaps.
+`memptrbuf(ptr)` derives that header with `(ptr - 1) & ~(MEM_SLAB_SIZE - 1)`.
+Regular allocations have no individual header, page hash, page reference count, radix tree,
+ownership cache or separate header pool. The class stride is in the owner queue.
 
-Page metadata contains two words: starting page plus active reference count,
-and slab-header pointer plus class/type tags. Free consumes the metadata
-returned by `tabhashrm`; it does not perform another ownership lookup. Every
-allocation adds one page reference and every free removes one. BIG allocations
-store their mapping length and type instead of a slab-header pointer; alignment
-prefixes are trimmed so their returned page is also the mapping base.
+The subtraction is part of the representation. A BIG allocation can return an
+over-aligned pointer exactly on a slab boundary; its header is in the preceding
+aligned region. Do not simplify this to masking `ptr` itself. BIG mappings retain
+the required prefix and trim the excess outside their header/payload mapping.
+Each BIG mapping has its own prefix header with `queue == NULL`, the returned
+address and the mapping length. Alignment space is in that prefix; only the
+requested payload size is reserved after the returned pointer.
+A regular slab's header has a nonnull queue. Free unmaps the header's mapping
+base, not its payload address. BIG usable capacity excludes the retained prefix.
 
-The class uses six low bits and the type uses two, requiring a 256-byte header
-stride. The header is separate from payload memory. Both slab types share one
-header pool. Current layout checks enforce class/tag fit, header alignment and
-size, and one cache line per queue. Slab-tier checks prove that every bitmap has
-between one and word-bits slots. Current 32-bit BLK geometry fails that proof;
-change the geometry and validate it before enabling that configuration.
+Ordinary allocation alignment and small size-class spacing are 16 bytes. Cache
+lines align queue metadata, not every tiny payload. Page-sized RUN classes keep
+page-aligned slot bases. Explicit alignment reserves sufficient displacement
+inside the selected slot; index recovery floors the returned pointer's offset
+from the payload base by the class stride. Usable size subtracts that displacement.
 
-Slot allocation, free, header packing and whole-slab transfers do not copy live
-payloads. The libc shim still copies when a growing `realloc` needs a new slot;
-the design does not promise zero copies for arbitrary reallocations.
+Compile-time checks cover fundamental alignment, header size, slab alignment,
+summary coverage, slot-counter capacity and cache-line queue size. Geometry is
+word-size dependent; only Linux x86-64 has been exercised in this investigation.
+The library is a startup interposer: preload or link it at process startup.
+Its TLS pointer uses the initial-exec model. Live heap swapping, late allocator
+injection and mixing pointers between allocator instances are outside this model.
 
-## Queue and lifetime invariants
+## Bitmaps and queue invariants
 
-1. A local available queue contains exactly its owned slabs with nonzero free
-   bitmaps. Full slabs remain owned and counted in `nbuf`, but are unlinked.
-   The head serves allocations until exhausted. The last successful take
-   unlinks it immediately; the first subsequent free appends it exactly once.
-2. Bit zero of the queue head is its lock. Hold it across head selection,
-   bitmap changes, list changes and empty-slab release. Mask the bit on head
-   reads and preserve it on head writes. Head accesses remain atomic even
-   while locked because contenders also access that word. Unlock uses a
-   release store of the untagged head.
-3. An outstanding allocation's clear bit keeps its slab and header alive.
-   A freeing thread can obtain the owner and compute its index before taking
-   the queue lock because its own bit has not yet been set. After marking the
-   last free, release may recycle the header: do not access that header after
-   `memreleaseempty` returns.
-4. A global reserve contains only completely empty slabs. Only the last free
-   can retain, transfer or unmap a slab. Bitmap marking and release occur under
-   the same owner lock, so no separate seal or bitmap CAS is needed.
-5. Nested queue locking is local then global on release. Allocation detaches
-   from global and unlocks it before taking local. Preserve this ordering.
-   The detached empty slab is private during the transfer.
-6. Cross-thread frees mark the owning slab directly. They require no work from
-   the allocating thread, including after that thread exits. Queue locks can
-   spin while another thread holds them: this is not a wait-free allocator.
+1. Set shared leaf bits identify available slots. `bits` and `wordmap` summarize
+   nonempty shared leaves. Leaf zero's top bit is a head lease, never a slot:
+   physical slot 63 is unused on x86-64. Mask the lease before testing capacity,
+   selecting a slot, or deciding that a leaf is full.
+2. `busy` counts non-full leaves **excluding leaf zero**, under the queue lock.
+   It changes only when a leaf leaves/returns to its all-free state. Together
+   with leaf zero's valid mask it detects a wholly free shared slab without
+   scanning the bitmap. `max` bounds physical slot indices, including the
+   reserved lease position; it is not a count of user-visible slots.
+3. Each retained queue's current head has an owner-only `local` bitmap for
+   leaf-zero slots. A locked refill removes a batch from the shared bitmap,
+   leaves one shared slot available, and returns the remainder through `local`.
+   Owner allocations pop a local bit; owner frees return a bit to `local`.
+   Neither operation needs a locked instruction. Foreign threads never access
+   `local`; they publish to the shared leaf. Queue-address membership in the
+   current TLS table identifies owner frees without an allocation header.
+4. Available queues contain slabs with nonzero shared availability. Full slabs
+   stay owned/count in `nbuf`, but unlink. A retained head cannot be removed by
+   a foreign free, even if empty. Only its allocating thread retires that head,
+   after exhausting `local`; promotion/removal updates the lease bit under the
+   queue lock. Queues with a zero local retention limit have no leased head and
+   use the locked allocation path. This lease protects the pointer-to-bitmap
+   interval without per-allocation references. A cached bit is reserved from
+   the shared bitmap until its owner uses it or exits.
+5. Bit zero of `queue->head` locks summaries, leaf zero/full transitions, queue
+   membership and release. Interior foreign frees publish one bit with a
+   release CAS. A failed CAS retries against the new leaf; a zero leaf or final
+   free in an ordinary leaf takes the queue lock. Leaf zero's final shared free
+   may use CAS while its lease remains set. Shared takes synchronize with free
+   publication. No fast free accesses its header after its successful CAS.
+   Head accesses are atomic because contenders access the same word; unlock
+   release-stores the untagged head. Shared leaf accesses are atomic even under
+   the queue lock because interior frees do not take that lock.
+6. On glibc 2.32+, the documented `__libc_single_threaded` indicator permits
+   queue/leaf updates without a locked RMW while definitely single threaded.
+   The same bits and publication state are maintained. Never write or override
+   libc's indicator; other targets always use the shared atomic operations.
+7. A live allocation keeps its header, mapping and queue alive until it returns
+   its bit. Private-cache frees keep the head lease; shared frees finish all
+   accesses before publication can permit another thread to reclaim the slab.
+   Only a wholly free, unleased slab can transfer or unmap.
+8. Global reserves contain only empty slabs. Nested queue order is local then
+   global on release. Allocation detaches from global and unlocks it before
+   acquiring local. The detached empty slab is private during transfer.
+9. Cross-thread frees operate directly on the owning slab. They need no work
+   from the allocating thread, including after it exits. They may spin waiting
+   for a lock holder; this allocator is not wait-free.
 
-A per-buffer lock is not a drop-in replacement for queue locking. Selecting a
-header and then locking it must also prevent intervening removal and reuse.
-Any such change needs a lifetime argument covering that interval.
+A per-buffer lock alone does not protect selection followed by locking. Keep
+the head lease and the lifetime argument together when changing this interval.
 
-TLS and header-pool mappings currently persist. Empty payload slabs follow the
-local/global retention limits. Keep these distinct when evaluating thread churn
-and RSS; the existing measurements do not establish thread-exit reclamation.
+## Empty memory and zero-copy scope
 
-## Changing the implementation
+Retained local slabs keep their backing pages: returning an allocation to its
+bitmap does not discard those pages or force their next user to fault them in.
+Per-class slab-count limits still bound the local reserve. A leased current
+head is retained until its owner exhausts it; this can temporarily retain one
+extra empty head while other owned slabs are live.
 
-Start from a concrete missed operation, invariant violation or measured cost.
-Explain why the current owner lock, bitmap or page reference does not already
-solve it before adding counters, seals, caches, remote-free queues or another
-synchronization layer. The bitmap is ordinary state protected by its queue;
-extra locked RMWs inside that critical section duplicate synchronization.
+On an actual ownership release, surplus slabs unmap or enter the global reserve.
+Before global transfer, `MADV_DONTNEED` discards every payload page after the
+header page. Preserve caller errno if this optional discard fails, such as on
+an mlocked page. Global reserves may retain that payload when discard fails;
+no live payload or header page may be discarded.
 
-Keep queue selection and header lifetime in the same reasoning as bit updates.
-Avoid speculative unlocked head reads or publishing a head with its lock bit
-accidentally cleared. Global queue IDs and geometry initialize together before
-the release/acquire ready flag is published; TLS initialization is thread-local.
+A pthread key registers retirement once per allocator-using thread. The exiting
+owner clears its head leases, publishes remaining private bits, and marks each
+queue retired under its lock. Its empty slabs leave immediately. A retired
+queue has zero local reserve, so live slabs leave on their final remote free.
+Full slabs need no registry or owner-side draining to finish later.
 
-Per-allocation page-hash traffic is still a profiling candidate. An earlier
-slab-lifetime metadata/cache experiment produced stale ownership metadata and
-was reverted. Any replacement must explain removal, address reuse and lookup
-lifetime, and pass the same content checks before performance claims are made.
+TLS queue mappings still persist so outstanding cross-thread allocations retain
+valid owners. Complete TLS metadata reclamation is not implemented. If pthread
+key creation/registration fails, allocation remains usable but exit reclamation
+is forfeited. Active workers can retain more resident payload between bursts
+than the earlier eager-discard policy; thread exit now reclaims their caches.
+Virtual reservations, peak RSS, sampled RSS and idle retention are distinct.
 
-For allocator changes, run `usr/lib/c/build-malloc.sh` and the hash, eight-stage
-stress, alignment/capacity, eight-thread churn, cross-thread free and parked-owner
-checks at the affected optimization levels. The
-[adoption report](bit-lock-adoption-2026-10-27.md#validation) gives commands and
-the tested Perl subset. Test actual overlap, content preservation, release and
-cross-thread progress rather than private struct layouts.
+Allocation indexing, ownership recovery, free, whole-slab transfers and empty
+page discards do not copy live payloads. Growing `realloc` can still require a new
+slot and a payload copy; arbitrary reallocations do not have a zero-copy promise.
 
-For performance changes, compare the same Perl build and workload with fixed
-hash settings, rotate allocator order over multiple rounds, and retain raw
-observations. Run benchmarks after stress tests finish. Report both time and
-memory, specify sampled versus peak RSS, and identify the tested scope. Update
-this note if the representation or invariants change.
+## Changing and validating the design
 
-## Evidence
+Start from a concrete invariant violation or measured cost. Explain why existing
+address geometry, bitmaps and ownership do not already solve it before adding
+metadata, caches, counters or synchronization. Keep the representation and its
+lifetime proof together. Global queues initialize before release/acquire
+publication of the ready flag; TLS initialization is thread-local.
+The shim checks global readiness only when creating a thread's TLS. Nonnull
+`t_memtls` proves global initialization already completed, including during
+recursive allocations from pthread-key setup. Engine `memget` requires that
+initialization and does not repeat it. In-place `realloc` and `realloc(ptr, 0)`
+do not initialize a new allocating-thread context. Existing calloc zero/overflow
+and posix_memalign/memalign alignment rejections precede thread setup.
 
-- [Initial review and prototype](bit-lock-review-2026-10-27.md).
-- [Adopted implementation, validation and measurements](bit-lock-adoption-2026-10-27.md).
-- [Raw nine-round adoption observations](bit-lock-adoption-2026-10-27-results.json).
+The generic tabhash utility owns its lock-bit constants and does not depend on
+the allocator header. Removed payload-based unmap/page-index macros must not
+be resurrected: slabs release their aligned header base, not `buf->adr`.
 
-The adoption comparison measured 31.0% lower sampled RSS and 8.8% less process
-time than `dcb3dac` on the recorded Perl churn workload. Those are workload
-results, not general throughput or scalability guarantees.
+Run `usr/lib/c/build-malloc.sh` and `usr/lib/c/test-malloc.sh` at affected
+optimization levels. Coverage includes content/overlap, alignment and whole
+reported capacity, realloc growth, eight-thread churn, cross-thread frees,
+parked owners, and allocating before thread creation while workers free and the
+owner continues allocating. Keep alignment tests across slab/BIG thresholds and
+large explicit alignments, and errno preservation when reclamation meets a
+locked payload page after its owner exits. Exercise owner reuse while a peer
+frees the same slab's earlier allocations. The general tabhash utility remains independently
+tested, but is not allocator metadata.
+
+Compare against the same Perl build with fixed hash settings and rotated order
+over multiple rounds; retain raw observations. Run timings after tests finish.
+Measure both sampled live RSS and worker/burst retention. For Perl integration,
+run its full harness as well as focused cases. Document tested configurations
+and skips; extend to debugging/RC-stack variants and real applications before
+claiming those results. Update this guide when representation or invariants change.
+
+A Perl binary built with ithreads does not make its workload concurrent. Use
+`bench-malloc.py --threads 4 --count 75000` for actual worker threads. Its partial
+free/refill checkpoints retain interleaved payloads and pool capacities, then
+separately measure full payload cleanup and worker exit. Perl also reuses its
+own arenas; these measurements do not attribute every reused slot to malloc.
+
+The single-thread indicator follows the
+[glibc execution-mode contract](https://sourceware.org/glibc/manual/2.44/html_node/Single_002dThreaded.html).

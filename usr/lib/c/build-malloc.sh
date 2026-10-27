@@ -22,4 +22,10 @@ cc=${CC:-cc}
     -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-xfree-mt"
 "$cc" -std=gnu11 "$opt" -g -fno-builtin -pthread "$src/c/malloc-mtstress.c" \
     -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-mtstress"
+"$cc" -std=gnu11 "$opt" -g -fno-builtin -pthread "$src/c/malloc-transition-test.c" \
+    -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-transition-test"
+"$cc" -std=gnu11 "$opt" -g -fno-builtin -pthread "$src/c/malloc-errno-test.c" \
+    -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-errno-test"
+"$cc" -std=gnu11 "$opt" -g -fno-builtin -pthread "$src/c/malloc-slab-race.c" \
+    -L "$out" -Wl,-rpath,"$out" -lvelhomalloc -o "$out/malloc-slab-race"
 printf '%s\n' "$out/libvelhomalloc.so"

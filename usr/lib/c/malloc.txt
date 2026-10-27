@@ -1,3 +1,6 @@
+Historical author notes: the proposed API below is not the maintained interface.
+Current implementation: ../../../doc/allocator-design.md
+
 Dynamic Memory
 --------------
 
