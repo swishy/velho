@@ -23,9 +23,10 @@ jobs:
       matrix:
         opt: [O0, O2, O3]
     env:
-      BUILD_DIR: ${{ runner.temp }}/malloc-${{ matrix.opt }}
       OPT: ${{ matrix.opt }}
     steps:
+      - name: Set build directory on the runner
+        run: printf 'BUILD_DIR=%s/malloc-%s\n' "$RUNNER_TEMP" "$OPT" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
