@@ -19,6 +19,9 @@
 #include <zen/sys/unix.h>
 #include <zen/hash.h>
 
+#define TABHASH_LK_BIT_OFS 0
+#define TABHASH_LK_BIT ((uintptr_t)1 << TABHASH_LK_BIT_OFS)
+
 extern TABHASH_TAB_T   *TABHASH_BUF;
 
 #define tabhashfind(hash, key)  tabhashop(hash, key, TABHASH_FIND)
@@ -51,9 +54,9 @@ static __inline__ void
 tabhashputtab(TABHASH_TAB_T *tab)
 {
     TABHASH_TAB_T      *head;
-    mtlkbit((m_atomic_t *)&TABHASH_BUF, MEM_LK_BIT_OFS);
+    mtlkbit((m_atomic_t *)&TABHASH_BUF, TABHASH_LK_BIT_OFS);
     head = TABHASH_BUF;
-    head = (void *)((uintptr_t)head & ~MEM_LK_BIT);
+    head = (void *)((uintptr_t)head & ~TABHASH_LK_BIT);
     if (head) {
         head->prev = tab;
     }
@@ -73,9 +76,9 @@ tabhashgettab(void)
     long                ntab;
 
     /* lock buffer */
-    mtlkbit((m_atomic_t *)&TABHASH_BUF, MEM_LK_BIT_OFS);
+    mtlkbit((m_atomic_t *)&TABHASH_BUF, TABHASH_LK_BIT_OFS);
     tab = TABHASH_BUF;
-    tab = (void *)((uintptr_t)tab & ~MEM_LK_BIT);
+    tab = (void *)((uintptr_t)tab & ~TABHASH_LK_BIT);
     if (!tab) {
         int8_t         *ptr = mapanon(-1, TABHASH_BUF_SIZE, 0);
         TABHASH_TAB_T  *cur;
@@ -141,8 +144,8 @@ tabhashadd(TABHASH_TAB_T **hashtab, const uintptr_t key, const uintptr_t val)
      * an explicit stored flag, append a fresh subtable at the tail on
      * exhaustion, keep the slot separate for lock/unlock. */
     slot = TABHASH_HASH(key);
-    mtlkbit((m_atomic_t *)&hashtab[slot], MEM_LK_BIT_OFS);
-    head = (void *)((uintptr_t)hashtab[slot] & ~MEM_LK_BIT);
+    mtlkbit((m_atomic_t *)&hashtab[slot], TABHASH_LK_BIT_OFS);
+    head = (void *)((uintptr_t)hashtab[slot] & ~TABHASH_LK_BIT);
     tab = head;
     while (tab) {
         ndx = tab->ncur;
@@ -205,9 +208,9 @@ tabhashop(TABHASH_TAB_T **hashtab, const uintptr_t val, long cmd)
 
     ndx = TABHASH_HASH(val);
     prev = NULL;
-    mtlkbit((m_atomic_t *)&hashtab[ndx], MEM_LK_BIT_OFS);
+    mtlkbit((m_atomic_t *)&hashtab[ndx], TABHASH_LK_BIT_OFS);
     head = hashtab[ndx];
-    tab = (void *)((uintptr_t)head & ~MEM_LK_BIT);
+    tab = (void *)((uintptr_t)head & ~TABHASH_LK_BIT);
     head = tab;
     while (tab) {
         lim = tab->ncur;

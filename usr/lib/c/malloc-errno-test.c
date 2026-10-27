@@ -3,19 +3,30 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 /* A valid free must preserve errno even if optional cold-page reclamation
  * cannot discard an mlocked payload page. No private allocator layout used. */
-int main(void)
+enum { N = 1024 };
+static void *blocks[N];
+static void *owner(void *unused)
 {
-    enum { N = 1024 };
-    void *blocks[N];
+    (void)unused;
     for (int i = 0; i < N; ++i) {
         blocks[i] = malloc(32);
-        if (!blocks[i]) return 1;
+        if (!blocks[i]) abort();
     }
+    return NULL;
+}
+int main(void)
+{
+    /* The owner exits with these allocations live. Their final free now
+     * releases ownership, exercising the optional discard failure path. */
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, owner, NULL)
+        || pthread_join(thread, NULL)) return 1;
     size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     void *page = (void *)((uintptr_t)blocks[900] & ~(uintptr_t)(page_size - 1));
     if (mlock(page, page_size)) {

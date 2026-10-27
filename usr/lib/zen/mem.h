@@ -8,18 +8,13 @@
 #include <mach/param.h>
 #include <mach/types.h>
 #include <mt/mtx.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <zero/trix.h>
 
 #define MEM_LK_BIT_OFS                  0
 #define MEM_LK_BIT                      ((m_atomic_t)1L << MEM_LK_BIT_OFS)
 
-#define memfreebuf(buf)                 unmapanon(buf->adr, buf->size)
-
 #define MEM_ALIGN_MIN                   16
 
-#define mempageadr(adr)         ((uintptr_t)(adr) & ~(PAGESIZE - 1))
 #define memalignptr(ptr, aln)   ((void *)roundup2((uintptr_t)ptr, aln))
 
 #define MEM_BLK                 0
@@ -30,10 +25,13 @@
 #define MEM_BLK_QUEUES          (MEM_BLK_MAX / MEM_BLK_UNIT)
 #define MEM_BLK_MID_QUEUE_MIN   (MEM_BLK_QUEUES >> 2)
 #define MEM_BLK_BIG_QUEUE_MIN   (MEM_BLK_QUEUES >> 1)
-/* Root -> summary word -> allocation word, all under the owner lock. */
+/* Queue lock covers summaries and leaf transitions, not interior bit changes.
+ * One non-slot bit in leaf zero carries its head lease. */
 #define MEM_BUF_MAP_BITS        (CHAR_BIT * sizeof(uintptr_t))
 #define MEM_BUF_MAP_WORDS       (4 * MEM_BUF_MAP_BITS)
 #define MEM_BUF_SUM_WORDS       4
+#define MEM_BUF_HEAD_BIT        ((uintptr_t)1 << (MEM_BUF_MAP_BITS - 1))
+#define MEM_BUF_FLAGS           MEM_BUF_HEAD_BIT
 #define MEM_SLAB_SIZE           (4 * MEM_BLK_UNIT * MEM_BUF_MAP_BITS * MEM_BUF_MAP_BITS)
 /* Subtract one: an over-aligned BIG pointer can lie at the next boundary. */
 #define memptrbuf(ptr)                                                  \
@@ -76,9 +74,9 @@
 struct membuf {
     int8_t             *adr;    /* first allocation */
     size_t              size;   /* mapped slab size */
-    unsigned short      max;    /* slot capacity */
-    unsigned short      nfree;  /* cached bitmap population, under owner lock */
-    unsigned short      high;   /* highest slot issued since payload purge */
+    unsigned short      max;    /* physical slot index limit */
+    unsigned short      busy;   /* non-full leaves excluding zero; queue lock */
+    uintptr_t           local;  /* owner-only leaf-zero bits; leased head only */
     uintptr_t           bits;   /* summary of nonempty bitmap words */
     uintptr_t           wordmap[MEM_BUF_SUM_WORDS];
     uintptr_t           map[MEM_BUF_MAP_WORDS];
@@ -88,12 +86,14 @@ struct membuf {
 };
 
 /* Available buffers only; nbuf includes full buffers owned by this queue.
- * The low bit of head locks the queue and every owned buffer's bitmap. */
+ * The low bit of head locks queue/lifetime and leaf zero/full transitions.
+ * A retained queue's head is leased until its allocator removes it. */
 struct membufq {
     size_t              size;   /* allocation stride identifies the class */
     long                nbuf;
     struct membuf      *head;
     struct membuf      *tail;
+    int                 retired; /* owner exited; no local reserve */
 } ALIGNED(CLSIZE);
 
 struct memtls {
@@ -121,8 +121,10 @@ struct memglob {
 };
 
 void    meminit(struct memglob *mem);
+/* Engine entry: shim_init has initialized globals and this thread's TLS. */
 void   *memget(size_t size, size_t align, size_t *retsize);
 void    memput(void *ptr);
+void    memretire(struct memtls *tls);
 
 _Static_assert(MEM_ALIGN_MIN >= _Alignof(max_align_t),
                "ordinary malloc must satisfy fundamental alignment");
@@ -139,7 +141,7 @@ _Static_assert((MEM_SLAB_SIZE & (MEM_SLAB_SIZE - 1)) == 0
                && MEM_BUF_SUM_WORDS <= MEM_BUF_MAP_BITS,
                "aligned slabs and bitmap summaries must cover every slot");
 _Static_assert(MEM_SLAB_SIZE / MEM_BLK_UNIT <= USHRT_MAX,
-               "slot counters must hold a complete allocation bitmap");
+               "physical slot indices must fit in the header");
 
 extern struct memglob g_mem ALIGNED(PAGESIZE);
 

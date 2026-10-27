@@ -1,0 +1,124 @@
+O0
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+hash-build 41 ms, scan 5 ms, str+sort 11 ms (n=1143894, s=20000)
+RSS: 31344 kB
+THREADED workers=4 count-per-worker=3000
+RSS: 21720 kB
+RSS_PARTIAL: 21720 kB
+RSS_REFILL: 22296 kB
+RSS_FREED: 22296 kB
+RSS_JOINED: 11312 kB
+mean-worker hash-build 6 ms, scan 2 ms, str+sort 2 ms
+mean-worker partial-free 2 ms, refill 6 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+O2
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+hash-build 29 ms, scan 4 ms, str+sort 9 ms (n=1143894, s=20000)
+RSS: 31328 kB
+THREADED workers=4 count-per-worker=3000
+RSS: 21712 kB
+RSS_PARTIAL: 21712 kB
+RSS_REFILL: 22288 kB
+RSS_FREED: 22288 kB
+RSS_JOINED: 11304 kB
+mean-worker hash-build 4 ms, scan 1 ms, str+sort 2 ms
+mean-worker partial-free 1 ms, refill 3 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+O3
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+hash-build 31 ms, scan 6 ms, str+sort 11 ms (n=1143894, s=20000)
+RSS: 31324 kB
+THREADED workers=4 count-per-worker=3000
+RSS: 21720 kB
+RSS_PARTIAL: 21720 kB
+RSS_REFILL: 22296 kB
+RSS_FREED: 22296 kB
+RSS_JOINED: 11312 kB
+mean-worker hash-build 4 ms, scan 1 ms, str+sort 2 ms
+mean-worker partial-free 1 ms, refill 4 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+musl
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+THREADED workers=4 count-per-worker=3000
+RSS: 19652 kB
+RSS_PARTIAL: 19656 kB
+RSS_REFILL: 20220 kB
+RSS_FREED: 20220 kB
+RSS_JOINED: 9292 kB
+mean-worker hash-build 7 ms, scan 1 ms, str+sort 4 ms
+mean-worker partial-free 2 ms, refill 10 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+Optimized blead full harness
+../dist/Devel-PPPort/t/warn.t ........................................ ok
+All tests successful.
+Files=2996, Tests=1435560, 234 wallclock secs (44.85 usr  9.38 sys + 441.50 cusr 85.07 csys = 580.80 CPU)
+Result: PASS
+Finished test run at Wed Oct 28 01:46:59 2026.

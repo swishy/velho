@@ -10,6 +10,8 @@ address-derived ownership, bitmap approach, lifetime invariants and validation
 requirements.
 The [allocator CI and release guide](doc/allocator-ci.md) explains automated
 tests and the malloc library releases published from successful `main` pushes.
+The [performance guide](doc/allocator-performance.md) records current results,
+their limits and reproduction commands.
 
 I started Velho to grab together my earlier code, mostly the better parts mostly
 from

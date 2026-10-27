@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <zen/_hash.h>
-#include <zen/mem.h>
+#include <mach/param.h>
 
 /* Standalone configuration for the general tabhash utility. The allocator
  * derives ownership from aligned addresses and does not use this table. */
@@ -38,7 +38,7 @@ int main(void)
     struct tabhashtab *tab = g_memhashtab[TABHASH_HASH(page)];
     assert(tab->ncur == 1);
     assert(TABHASH_GET_NREF(&tab->items[0]) == 64);
-    for (int i = 63; i > 0; --i) {
+    for (uintptr_t i = 63; i > 0; --i) {
         assert(tabhashrm(g_memhashtab, page).page);
         struct memhash item = tabhashfind(g_memhashtab, page);
         assert(TABHASH_GET_NREF(&item) == i);

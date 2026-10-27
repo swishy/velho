@@ -15,6 +15,41 @@
 struct memglob g_mem ALIGNED(PAGESIZE);
 THREADLOCAL struct memtls *t_memtls;
 
+/* The same public libc proof used by the queue bit lock also applies to
+ * published leaf words. Other targets always use the shared atomic path. */
+static INLINE uintptr_t
+memmapor(uintptr_t *map, uintptr_t bits)
+{
+    if (memsinglethreaded()) {
+        uintptr_t old = __atomic_load_n(map, __ATOMIC_RELAXED);
+        __atomic_store_n(map, old | bits, __ATOMIC_RELEASE);
+        return old;
+    }
+    return __atomic_fetch_or(map, bits, __ATOMIC_ACQ_REL);
+}
+
+static INLINE uintptr_t
+memmapand(uintptr_t *map, uintptr_t bits)
+{
+    if (memsinglethreaded()) {
+        uintptr_t old = __atomic_load_n(map, __ATOMIC_RELAXED);
+        __atomic_store_n(map, old & bits, __ATOMIC_RELEASE);
+        return old;
+    }
+    return __atomic_fetch_and(map, bits, __ATOMIC_ACQ_REL);
+}
+
+static INLINE int
+memtryfree(uintptr_t *map, uintptr_t *old, uintptr_t next)
+{
+    if (memsinglethreaded()) {
+        __atomic_store_n(map, next, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return __atomic_compare_exchange_n(map, old, next, 1,
+                                       __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
 void
 meminit(struct memglob *mem)
 {
@@ -49,6 +84,20 @@ memqsethead(struct membufq *q, struct membuf *head)
                      __ATOMIC_RELAXED);
 }
 
+static INLINE int
+memqretains(struct membufq *q)
+{
+    return !q->retired && q->size <= MEM_SLAB_SIZE / 2;
+}
+
+static INLINE uintptr_t
+memwordmask(struct membuf *buf, size_t word)
+{
+    size_t count = min(buf->max - word * MEM_BUF_MAP_BITS, MEM_BUF_MAP_BITS);
+    uintptr_t mask = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - count);
+    return word ? mask : mask & ~MEM_BUF_FLAGS;
+}
+
 static INLINE void
 memqlock(struct membufq *q)
 {
@@ -78,6 +127,9 @@ memqueuebuf(struct membufq *q, struct membuf *buf)
     if (q->tail) {
         q->tail->next = buf;
     } else {
+        if (memqretains(q)) {
+            memmapor(&buf->map[0], MEM_BUF_HEAD_BIT);
+        }
         memqsethead(q, buf);
     }
     q->tail = buf;
@@ -89,6 +141,10 @@ memdequebuf(struct membufq *q, struct membuf *buf)
     if (buf->prev) {
         buf->prev->next = buf->next;
     } else {
+        memmapand(&buf->map[0], ~MEM_BUF_HEAD_BIT);
+        if (buf->next && memqretains(q)) {
+            memmapor(&buf->next->map[0], MEM_BUF_HEAD_BIT);
+        }
         memqsethead(q, buf->next);
     }
     if (buf->next) {
@@ -121,12 +177,12 @@ memnewbuf(size_t stride, long type)
     buf->adr = (int8_t *)buf + offset;
     buf->size = MEM_SLAB_SIZE;
     buf->max = (MEM_SLAB_SIZE - offset) / stride;
-    buf->nfree = buf->max;
     buf->bits = 0;
     for (size_t word = 0, start = 0; start < buf->max;
          ++word, start += MEM_BUF_MAP_BITS) {
         size_t count = min(buf->max - start, MEM_BUF_MAP_BITS);
-        buf->map[word] = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - count);
+        buf->map[word] = (UINTPTR_MAX >> (MEM_BUF_MAP_BITS - count))
+            & (word ? UINTPTR_MAX : ~MEM_BUF_FLAGS);
         buf->wordmap[word / MEM_BUF_MAP_BITS] |= (uintptr_t)1 << (word % MEM_BUF_MAP_BITS);
         buf->bits |= (uintptr_t)1 << (word / MEM_BUF_MAP_BITS);
     }
@@ -139,8 +195,20 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
     struct membufq *q = type == MEM_BLK
         ? &t_memtls->blktab[qid] : &t_memtls->runtab[qid];
     size_t size = q->size;
-    memqlock(q);
     struct membuf *buf = memqhead(q);
+    int8_t *ptr;
+    /* Only this thread removes a retained head. Owner-only cached bits need
+     * neither an allocation reference nor an atomic operation. */
+    if (buf && memqretains(q)) {
+        uintptr_t local = buf->local;
+        if (local) {
+            buf->local = local & (local - 1);
+            ptr = buf->adr + m_ctz(local) * size;
+            goto out;
+        }
+    }
+    memqlock(q);
+    buf = memqhead(q);
     if (!buf) {
         memqunlock(q);
         struct membufq *glob = type == MEM_BLK
@@ -166,22 +234,34 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
     }
     unsigned long group = m_ctz(buf->bits);
     unsigned long word = group * MEM_BUF_MAP_BITS + m_ctz(buf->wordmap[group]);
-    unsigned long index = word * MEM_BUF_MAP_BITS + m_ctz(buf->map[word]);
-    int8_t *ptr = buf->adr + index * size;
-    if (index >= buf->high) {
-        buf->high = index + 1;
+    uintptr_t mask = __atomic_load_n(&buf->map[word], __ATOMIC_RELAXED);
+    uintptr_t avail = mask & (word ? UINTPTR_MAX : ~MEM_BUF_FLAGS);
+    uintptr_t bit = avail & -avail;
+    uintptr_t take = bit;
+    if (!word && memqretains(q) && (avail & (avail - 1))) {
+        /* Reserve a batch for this owner, leaving one shared free bit so
+         * the head remains available until the local batch is exhausted. */
+        take = avail & (avail - 1);
+        bit = take & -take;
+        buf->local = take & ~bit;
     }
-    buf->map[word] &= buf->map[word] - 1;
-    if (!buf->map[word]) {
+    unsigned long index = word * MEM_BUF_MAP_BITS + m_ctz(bit);
+    ptr = buf->adr + index * size;
+    mask = memmapand(&buf->map[word], ~take);
+    if (word && mask == memwordmask(buf, word)) {
+        ++buf->busy;
+    }
+    if (!((mask & ~take) & (word ? UINTPTR_MAX : ~MEM_BUF_FLAGS))) {
         buf->wordmap[group] &= ~((uintptr_t)1 << (word % MEM_BUF_MAP_BITS));
         if (!buf->wordmap[group]) {
             buf->bits &= ~((uintptr_t)1 << group);
         }
     }
-    if (!--buf->nfree) {
+    if (!buf->bits) {
         memdequebuf(q, buf);
     }
     memqunlock(q);
+out:
     if (align > (type == MEM_BLK ? MEM_BLK_UNIT : PAGESIZE)) {
         int8_t *aligned = memalignptr(ptr, align);
         if (retsize) {
@@ -194,26 +274,14 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
     return ptr;
 }
 
-/* Keep a small hot payload window, not an entire cold aligned slab.
- * The high-water slot avoids syscalls when that window was never exceeded.
- * The header remains resident; all payload slots are free under this lock. */
+/* Empty, detached slab: discard payload on ownership release, not reuse.
+ * Its first page contains the header and remains resident. */
 static void
 mempurgeempty(struct membuf *buf)
 {
-    size_t size = buf->queue->size;
-    size_t data = size < PAGESIZE
-        ? (size <= PAGESIZE / 4 ? PAGESIZE
-           : size <= PAGESIZE / 2 ? 4 * PAGESIZE : 16 * PAGESIZE)
-        : max(size, 16 * PAGESIZE);
-    size_t offset = buf->adr - (int8_t *)buf;
-    size_t keep = min(MEM_SLAB_SIZE, roundup2(offset + data, PAGESIZE));
-    if (offset + buf->high * size > keep) {
-        int saved_errno = errno;
-        if (!madvise((int8_t *)buf + keep, MEM_SLAB_SIZE - keep, MADV_DONTNEED)) {
-            buf->high = 0;
-        }
-        errno = saved_errno;
-    }
+    int saved_errno = errno;
+    madvise((int8_t *)buf + PAGESIZE, MEM_SLAB_SIZE - PAGESIZE, MADV_DONTNEED);
+    errno = saved_errno;
 }
 
 /* Owner lock covers the last free and every queue/lifetime transition.
@@ -224,9 +292,9 @@ memreleaseempty(struct membuf *buf)
     struct membufq *q = buf->queue;
     long type = q->size < PAGESIZE ? MEM_BLK : MEM_RUN;
     unsigned long qid = q->size / (type == MEM_BLK ? MEM_BLK_UNIT : PAGESIZE);
-    long limit = type == MEM_BLK ? memnblktlsbuf(qid) : memnruntlsbuf(qid);
-    if (q->nbuf <= limit) {
-        mempurgeempty(buf);
+    long limit = q->retired ? 0
+        : type == MEM_BLK ? memnblktlsbuf(qid) : memnruntlsbuf(qid);
+    if (q->nbuf <= limit || (limit && memqhead(q) == buf)) {
         return;
     }
     memdequebuf(q, buf);
@@ -294,9 +362,6 @@ memget(size_t size, size_t align, size_t *retsize)
         errno = ENOMEM;
         return NULL;
     }
-    if (!(__atomic_load_n(&g_mem.flg, __ATOMIC_ACQUIRE) & MEM_INIT_BIT)) {
-        meminit(&g_mem);
-    }
     unsigned long qid = memblkqid(alnsz);
     if (qid < MEM_BLK_QUEUES) {
         return memgetsmall(qid, MEM_BLK, aln, retsize);
@@ -312,8 +377,8 @@ memget(size_t size, size_t align, size_t *retsize)
 void
 memput(void *ptr)
 {
-    /* This allocation keeps the embedded header and owner alive until
-     * its free bit is set under the owning queue lock. */
+    /* A live slot keeps its header/owner alive until the publishing CAS.
+     * After success the fast path must not touch either again. */
     struct membuf *buf = memptrbuf(ptr);
     struct membufq *q = buf->queue;
     if (!q) {
@@ -321,18 +386,80 @@ memput(void *ptr)
         return;
     }
     size_t index = ((uintptr_t)ptr - (uintptr_t)buf->adr) / q->size;
+    size_t word = index / MEM_BUF_MAP_BITS;
+    uintptr_t bit = (uintptr_t)1 << (index % MEM_BUF_MAP_BITS);
+    uintptr_t valid = memwordmask(buf, word);
+    uintptr_t mask = __atomic_load_n(&buf->map[word], __ATOMIC_RELAXED);
+    /* Only the allocating thread touches local. A head is retired only by
+     * that thread, after local is exhausted, so there is nothing to drain. */
+    if (!word && (mask & MEM_BUF_HEAD_BIT)
+        && (uintptr_t)q - (uintptr_t)t_memtls < sizeof(struct memtls)) {
+        buf->local |= bit;
+        return;
+    }
+    for (;;) {
+        uintptr_t next = mask | bit;
+        if (!(mask & valid)
+            || ((next & valid) == valid
+                && (word || !(mask & MEM_BUF_HEAD_BIT)))) {
+            break;
+        }
+        if (memtryfree(&buf->map[word], &mask, next)) return;
+    }
     memqlock(q);
     uintptr_t old = buf->bits;
-    size_t word = index / MEM_BUF_MAP_BITS;
-    buf->map[word] |= (uintptr_t)1 << (index % MEM_BUF_MAP_BITS);
+    mask = memmapor(&buf->map[word], bit);
     size_t group = word / MEM_BUF_MAP_BITS;
     buf->wordmap[group] |= (uintptr_t)1 << (word % MEM_BUF_MAP_BITS);
     buf->bits |= (uintptr_t)1 << group;
     if (!old) {
         memqueuebuf(q, buf);
     }
-    if (++buf->nfree == buf->max) {
-        memreleaseempty(buf);
+    if (word && ((mask | bit) & valid) == valid) {
+        --buf->busy;
+    }
+    if (!buf->busy) {
+        uintptr_t first = __atomic_load_n(&buf->map[0], __ATOMIC_ACQUIRE);
+        uintptr_t all = memwordmask(buf, 0);
+        if ((first & ~MEM_BUF_FLAGS) == all) {
+            memreleaseempty(buf);
+        }
     }
     memqunlock(q);
+}
+
+/* The queue tables stay mapped for outstanding remote frees. Empty slabs
+ * leave immediately; a live slab leaves when its final remote free arrives. */
+void
+memretire(struct memtls *tls)
+{
+    for (size_t type = MEM_BLK; type <= MEM_RUN; ++type) {
+        struct membufq *table = type == MEM_BLK ? tls->blktab : tls->runtab;
+        size_t count = type == MEM_BLK ? MEM_BLK_QUEUES : MEM_RUN_QUEUES;
+        for (size_t i = 1; i < count; ++i) {
+            struct membufq *q = &table[i];
+            memqlock(q);
+            q->retired = 1;
+            struct membuf *buf = memqhead(q);
+            if (buf) {
+                memmapand(&buf->map[0], ~MEM_BUF_HEAD_BIT);
+                if (buf->local) {
+                    memmapor(&buf->map[0], buf->local);
+                    buf->local = 0;
+                    buf->wordmap[0] |= 1;
+                    buf->bits |= 1;
+                }
+            }
+            while (buf) {
+                struct membuf *next = buf->next;
+                if (!buf->busy
+                    && (__atomic_load_n(&buf->map[0], __ATOMIC_ACQUIRE) & ~MEM_BUF_FLAGS)
+                        == memwordmask(buf, 0)) {
+                    memreleaseempty(buf);
+                }
+                buf = next;
+            }
+            memqunlock(q);
+        }
+    }
 }

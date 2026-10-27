@@ -15,8 +15,13 @@ timeout -k 5s 90s "$out/malloc-xfree-mt"
 timeout -k 5s 90s "$out/malloc-parked-test"
 timeout -k 5s 90s "$out/malloc-transition-test"
 timeout -k 5s 90s "$out/malloc-errno-test"
+timeout -k 5s 90s "$out/malloc-slab-race"
 # Exercise a real consumer as well as the C tests. This is a smoke test,
 # not the separate source-built Perl core harness or a performance gate.
 timeout -k 5s 90s env LD_PRELOAD="$out/libvelhomalloc.so" \
     PERL_HASH_SEED=42 PERL_PERTURB_KEYS=0 \
     perl "$src/c/bench-perl-churn.pl" 30000
+# Actual ithreads, including partial holes/refill before full worker teardown.
+timeout -k 5s 90s env LD_PRELOAD="$out/libvelhomalloc.so" \
+    PERL_HASH_SEED=42 PERL_PERTURB_KEYS=0 \
+    perl "$src/c/bench-perl-threads.pl" 3000 4
