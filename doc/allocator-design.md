@@ -56,6 +56,10 @@ injection and mixing pointers between allocator instances are outside this model
    with leaf zero's valid mask it detects a wholly free shared slab without
    scanning the bitmap. `max` bounds physical slot indices, including the
    reserved lease position; it is not a count of user-visible slots.
+   `lastmask` is the immutable capacity mask for the final leaf, calculated
+   once when the slab is created. Other leaves use an all-ones mask; leaf zero
+   always excludes the lease bit. Global transfer preserves this geometry.
+   Owner-only frees return before calculating any shared valid mask.
 3. Each retained queue's current head has an owner-only `local` bitmap for
    leaf-zero slots. A locked refill removes a batch from the shared bitmap,
    leaves one shared slot available, and returns the remainder through `local`.

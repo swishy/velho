@@ -76,6 +76,7 @@ struct membuf {
     size_t              size;   /* mapped slab size */
     unsigned short      max;    /* physical slot index limit */
     unsigned short      busy;   /* non-full leaves excluding zero; queue lock */
+    uintptr_t           lastmask; /* immutable valid bits in final leaf */
     uintptr_t           local;  /* owner-only leaf-zero bits; leased head only */
     uintptr_t           bits;   /* summary of nonempty bitmap words */
     uintptr_t           wordmap[MEM_BUF_SUM_WORDS];

@@ -93,8 +93,9 @@ memqretains(struct membufq *q)
 static INLINE uintptr_t
 memwordmask(struct membuf *buf, size_t word)
 {
-    size_t count = min(buf->max - word * MEM_BUF_MAP_BITS, MEM_BUF_MAP_BITS);
-    uintptr_t mask = UINTPTR_MAX >> (MEM_BUF_MAP_BITS - count);
+    /* Capacity is immutable. Only the final leaf can be partial. */
+    uintptr_t mask = word == (buf->max - 1U) / MEM_BUF_MAP_BITS
+        ? buf->lastmask : UINTPTR_MAX;
     return word ? mask : mask & ~MEM_BUF_FLAGS;
 }
 
@@ -177,6 +178,7 @@ memnewbuf(size_t stride, long type)
     buf->adr = (int8_t *)buf + offset;
     buf->size = MEM_SLAB_SIZE;
     buf->max = (MEM_SLAB_SIZE - offset) / stride;
+    buf->lastmask = UINTPTR_MAX >> ((-buf->max) & (MEM_BUF_MAP_BITS - 1));
     buf->bits = 0;
     for (size_t word = 0, start = 0; start < buf->max;
          ++word, start += MEM_BUF_MAP_BITS) {
@@ -388,7 +390,6 @@ memput(void *ptr)
     size_t index = ((uintptr_t)ptr - (uintptr_t)buf->adr) / q->size;
     size_t word = index / MEM_BUF_MAP_BITS;
     uintptr_t bit = (uintptr_t)1 << (index % MEM_BUF_MAP_BITS);
-    uintptr_t valid = memwordmask(buf, word);
     uintptr_t mask = __atomic_load_n(&buf->map[word], __ATOMIC_RELAXED);
     /* Only the allocating thread touches local. A head is retired only by
      * that thread, after local is exhausted, so there is nothing to drain. */
@@ -397,6 +398,7 @@ memput(void *ptr)
         buf->local |= bit;
         return;
     }
+    uintptr_t valid = memwordmask(buf, word);
     for (;;) {
         uintptr_t next = mask | bit;
         if (!(mask & valid)

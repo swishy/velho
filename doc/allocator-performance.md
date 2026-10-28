@@ -6,7 +6,11 @@ The measured O2 allocator has SHA-256
 The [design guide](allocator-design.md) defines the maintained representation;
 the [CI guide](allocator-ci.md) covers building, testing and releases.
 
-## Current comparison
+The comparison below describes the baseline before the mask simplification.
+The latest implementation and its measurements are recorded under “Simplified
+capacity masks” at the end of this document.
+
+## Baseline comparison
 
 Nine rounds rotate glibc, pre-cleanup Velho and current Velho. Builds and tests
 finished before timing. Perl comparisons use the **same unmodified Perl 5.44.0
@@ -124,3 +128,117 @@ bitmap-reuse build, SHA-256
 `153573b1b4adbbebf7d9cf72e9befa96f31e7d3b0387497fa37337a25dead27c`.
 Paths in those records identify the original local experiment. Superseded
 investigation reports and prototype patches are not maintained instructions.
+
+## Generalized leaf batching experiment
+
+On 28 October 2026, an experimental change extended the owner cache from leaf
+zero to any selected bitmap leaf. The leaf index fit in existing header padding.
+Owner frees checked the retained head and selected leaf; thread exit published
+the cached leaf and updated its summary and busy count.
+
+Nine rotating rounds compared the same freshly built O2 baseline and experiment.
+Median elapsed seconds, baseline -> experiment:
+
+- Single-thread Perl: 1.0511 -> 1.0158 (3.4% lower).
+- Four-worker Perl: 0.6167 -> 0.6284 (1.9% higher).
+- Eight-thread C churn: 0.1968 -> 0.2001 (1.7% higher).
+
+Perl sampled RSS was essentially unchanged. Contemporaneous glibc medians were
+1.0015, 0.7793 and 0.2319 seconds respectively. Absolute times differ from the
+earlier run above; compare variants within this experiment. These small mixed
+effects do not establish a general improvement or identify its cause. All nine
+standalone checks and both Perl smoke workloads passed at O0/O2/O3. No full Perl
+core harness or musl validation was run for this experiment.
+
+The implementation was restored to the baseline. The
+[experimental patch](benchmarks/2026-10-28/leaf-experiment/experiment.patch) and
+raw [single-thread](benchmarks/2026-10-28/leaf-experiment/single.json),
+[threaded Perl](benchmarks/2026-10-28/leaf-experiment/threaded.json), and
+[C churn](benchmarks/2026-10-28/leaf-experiment/c.json) observations preserve the
+result for follow-up.
+
+## Instruction profiling under competing host load
+
+Callgrind 3.22.0 profiled the unchanged O2 library above with branch simulation.
+The host was also running another C project; native timing differences are not
+used to rank candidates here. Callgrind counts instructions, not CPU cycles,
+and serializes threads: it cannot establish native contention or divide latency.
+Runs use the same Perl 5.44.0 build, fixed hash settings, 30,000 single-thread
+entries and 4 x 3,000 threaded entries. These smaller workloads include startup
+and teardown and must not be compared directly with the timing workloads.
+
+Single-thread total: 395,540,538 instructions. Source-attributed self counts:
+`memgetsmall` 28,652,510 (7.24%); `memput` 13,862,350 (3.50%);
+`memget` 8,184,571 (2.07%). Inlined lock helpers may be attributed separately.
+The cached allocation return executes 6,804 times versus 233,900 shared-path
+selections: about 2.8% of small allocations use the cache-only path.
+`memwordmask` source lines account for 4,916,207 instructions (1.24% of total),
+aggregated across callers and already included in their costs.
+
+Threaded total: 628,355,686 instructions. Corresponding source-attributed
+self counts are 21,098,980 (3.36%), 11,445,482 (1.82%) and 6,302,994 (1.00%).
+Cached allocations: 11,703 versus 173,646 shared-path selections (6.3%).
+Both workloads completed successfully; instrumented RSS and elapsed time are
+not native allocator performance measurements.
+
+Disassembly confirms `memput` executes a variable `divq` for slot decoding,
+and constructs the valid mask before the owner-only early return. Candidate
+experiments are simplifying full-leaf masks and replacing repeated division
+with exact precomputed class arithmetic. Neither has a demonstrated speedup.
+The generalized cache experiment remains inconclusive under competing load.
+
+Raw [single-thread](benchmarks/2026-10-28/callgrind/single.out) and
+[threaded](benchmarks/2026-10-28/callgrind/threaded.out) Callgrind profiles retain
+function, source-line and branch counts. Use `callgrind_annotate --auto=no
+--show=Ir PROFILE usr/lib/zen/mem.c` from the repository to inspect them.
+
+The full eight-thread C Callgrind run was interrupted without a completed
+profile. A reduced 8 x 2,000 iteration attempt also exceeded a 60-second limit.
+No C profiling conclusions are drawn; instrumentation/scheduling behavior needs
+investigation before using this workload under Callgrind. Native C tests passed
+in the preceding experiment.
+
+## Simplified capacity masks
+
+The maintained implementation now stores the final leaf's valid mask once at
+slab creation (`lastmask`). Other leaves use all ones; leaf zero still masks its
+lease bit. Owner-only frees return before shared-mask calculation. No ownership,
+publication or reclamation rules change. The x86-64 header grows from 2144 to
+2152 bytes, both rounded to 2176 bytes: slab capacity is unchanged. The final O2
+library SHA-256 is
+`12a3c8c8d223173f54f3671f2e30af658f1e354b82bf0666725c45736952777c`.
+
+An initial branch-around-shift variant was also checked, then superseded by
+precomputation. The retained version passes all nine C checks and both Perl
+smoke workloads at O0/O2/O3, and the O2 library compiles with
+`-Wall -Wextra -Werror`. An exhaustive comparison of every valid leaf for
+capacities 1..16384 matches the previous formula, including single-leaf, exact
+word-boundary and partial final leaves. No full Perl core harness or musl run was
+performed for this change. [Validation](benchmarks/2026-10-28/mask/validation.txt)
+and the [equivalence check](benchmarks/2026-10-28/mask/mask-equivalence.c) are saved.
+
+Against the preceding Callgrind baseline, single-thread total instructions fall
+from 395,540,538 to 394,819,228 (0.18%). `memgetsmall` self instructions fall
+from 28,652,510 to 27,953,241 (2.44%). Whole-program simulated branch misses fall
+from 3,917,955 to 3,860,793. These are instruction/simulation results, not elapsed
+speedups. Threaded whole-program counts vary substantially with scheduling and
+Perl's checkpoint polling, so their total difference is not attributed to masks.
+Assembly confirms that owner-only free returns precede mask work.
+
+Nine rotating native rounds, baseline -> new median elapsed seconds:
+
+- Single-thread Perl, 300,000 entries: 0.8194 -> 0.8059 (1.6% lower).
+- Four-worker Perl, 75,000 entries each: 0.7266 -> 0.7033 (3.2% lower).
+- Eight-thread C churn: 0.3406 -> 0.3430 (0.7% higher).
+
+The host concurrently runs another C project. Ranges overlap; these medians
+do not establish a reliable native speedup or regression. Sampled Perl RSS is
+essentially unchanged: 239,836 -> 239,816 KiB single-thread and
+247,484 -> 247,512 KiB at the threaded live checkpoint. The change is retained
+for removing repeated mask construction with unchanged slab capacity.
+
+Raw [single-thread timings](benchmarks/2026-10-28/mask/single.json),
+[threaded timings](benchmarks/2026-10-28/mask/threaded.json),
+[C timings](benchmarks/2026-10-28/mask/c.json),
+[single-thread profile](benchmarks/2026-10-28/mask/single.callgrind), and
+[threaded profile](benchmarks/2026-10-28/mask/threaded.callgrind) preserve results.
