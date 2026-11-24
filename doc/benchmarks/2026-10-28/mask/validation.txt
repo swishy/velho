@@ -1,0 +1,96 @@
+
+O0
+/tmp/velho-mask-cached-O0/libvelhomalloc.so
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+hash-build 33 ms, scan 5 ms, str+sort 9 ms (n=1143894, s=20000)
+RSS: 31424 kB
+THREADED workers=4 count-per-worker=3000
+RSS: 21796 kB
+RSS_PARTIAL: 21796 kB
+RSS_REFILL: 22372 kB
+RSS_FREED: 22372 kB
+RSS_JOINED: 11388 kB
+mean-worker hash-build 4 ms, scan 1 ms, str+sort 2 ms
+mean-worker partial-free 1 ms, refill 4 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+O2
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+hash-build 31 ms, scan 4 ms, str+sort 9 ms (n=1143894, s=20000)
+RSS: 31388 kB
+THREADED workers=4 count-per-worker=3000
+RSS: 21800 kB
+RSS_PARTIAL: 21800 kB
+RSS_REFILL: 22376 kB
+RSS_FREED: 22376 kB
+RSS_JOINED: 11392 kB
+mean-worker hash-build 5 ms, scan 1 ms, str+sort 2 ms
+mean-worker partial-free 1 ms, refill 6 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+O3
+/tmp/velho-mask-cached-O3/libvelhomalloc.so
+page sharing, collision chains, recycling: PASS
+stage 1
+stage 2
+stage 3
+stage 4
+stage 5
+stage 6
+stage 7
+stage 8
+ALL STAGES PASS
+aligned capacity, overlap, growth, reuse: PASS
+MT OK (8 threads x 150000 iters)
+XFREE produced=480000 consumed=480000 failures=0
+PARKED OK (all frees completed without owner assistance)
+thread transition and owner reuse: PASS
+free errno with locked payload: PASS
+hot reuse with concurrent cold release: PASS
+hash-build 35 ms, scan 4 ms, str+sort 11 ms (n=1143894, s=20000)
+RSS: 31404 kB
+THREADED workers=4 count-per-worker=3000
+RSS: 21804 kB
+RSS_PARTIAL: 21804 kB
+RSS_REFILL: 22380 kB
+RSS_FREED: 22380 kB
+RSS_JOINED: 11396 kB
+mean-worker hash-build 4 ms, scan 1 ms, str+sort 2 ms
+mean-worker partial-free 1 ms, refill 3 ms, cleanup 1 ms
+partial free, refill and worker cleanup: PASS
+
+Exhaustive mask equivalence: PASS, capacities 1..16384, every valid leaf.
+-Wall -Wextra -Werror O2 library build: PASS.
+Header sizeof 2152, rounded 2176 (unchanged rounded size).
