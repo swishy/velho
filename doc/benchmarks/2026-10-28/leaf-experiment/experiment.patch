@@ -1,0 +1,79 @@
+diff --git a/usr/lib/zen/mem.c b/usr/lib/zen/mem.c
+index c499b12..1e5e7c5 100644
+--- a/usr/lib/zen/mem.c
++++ b/usr/lib/zen/mem.c
+@@ -203,7 +203,7 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
+         uintptr_t local = buf->local;
+         if (local) {
+             buf->local = local & (local - 1);
+-            ptr = buf->adr + m_ctz(local) * size;
++            ptr = buf->adr + (buf->localword * MEM_BUF_MAP_BITS + m_ctz(local)) * size;
+             goto out;
+         }
+     }
+@@ -238,11 +238,12 @@ memgetsmall(unsigned long qid, long type, size_t align, size_t *retsize)
+     uintptr_t avail = mask & (word ? UINTPTR_MAX : ~MEM_BUF_FLAGS);
+     uintptr_t bit = avail & -avail;
+     uintptr_t take = bit;
+-    if (!word && memqretains(q) && (avail & (avail - 1))) {
++    if (memqretains(q) && (avail & (avail - 1))) {
+         /* Reserve a batch for this owner, leaving one shared free bit so
+          * the head remains available until the local batch is exhausted. */
+         take = avail & (avail - 1);
+         bit = take & -take;
++        buf->localword = word;
+         buf->local = take & ~bit;
+     }
+     unsigned long index = word * MEM_BUF_MAP_BITS + m_ctz(bit);
+@@ -388,15 +389,16 @@ memput(void *ptr)
+     size_t index = ((uintptr_t)ptr - (uintptr_t)buf->adr) / q->size;
+     size_t word = index / MEM_BUF_MAP_BITS;
+     uintptr_t bit = (uintptr_t)1 << (index % MEM_BUF_MAP_BITS);
+-    uintptr_t valid = memwordmask(buf, word);
+     uintptr_t mask = __atomic_load_n(&buf->map[word], __ATOMIC_RELAXED);
+     /* Only the allocating thread touches local. A head is retired only by
+      * that thread, after local is exhausted, so there is nothing to drain. */
+-    if (!word && (mask & MEM_BUF_HEAD_BIT)
+-        && (uintptr_t)q - (uintptr_t)t_memtls < sizeof(struct memtls)) {
++    if ((uintptr_t)q - (uintptr_t)t_memtls < sizeof(struct memtls)
++        && memqhead(q) == buf && memqretains(q)
++        && word == buf->localword) {
+         buf->local |= bit;
+         return;
+     }
++    uintptr_t valid = memwordmask(buf, word);
+     for (;;) {
+         uintptr_t next = mask | bit;
+         if (!(mask & valid)
+@@ -444,10 +446,14 @@ memretire(struct memtls *tls)
+             if (buf) {
+                 memmapand(&buf->map[0], ~MEM_BUF_HEAD_BIT);
+                 if (buf->local) {
+-                    memmapor(&buf->map[0], buf->local);
++                    size_t word = buf->localword;
++                    uintptr_t before = memmapor(&buf->map[word], buf->local);
++                    if (word && (before | buf->local) == memwordmask(buf, word)) {
++                        --buf->busy;
++                    }
+                     buf->local = 0;
+-                    buf->wordmap[0] |= 1;
+-                    buf->bits |= 1;
++                    buf->wordmap[word / MEM_BUF_MAP_BITS] |= (uintptr_t)1 << (word % MEM_BUF_MAP_BITS);
++                    buf->bits |= (uintptr_t)1 << (word / MEM_BUF_MAP_BITS);
+                 }
+             }
+             while (buf) {
+diff --git a/usr/lib/zen/mem.h b/usr/lib/zen/mem.h
+index 839e964..195c120 100644
+--- a/usr/lib/zen/mem.h
++++ b/usr/lib/zen/mem.h
+@@ -76,7 +76,8 @@ struct membuf {
+     size_t              size;   /* mapped slab size */
+     unsigned short      max;    /* physical slot index limit */
+     unsigned short      busy;   /* non-full leaves excluding zero; queue lock */
+-    uintptr_t           local;  /* owner-only leaf-zero bits; leased head only */
++    unsigned short      localword; /* owner-only cached leaf index */
++    uintptr_t           local;  /* owner-only bits; leased head only */
+     uintptr_t           bits;   /* summary of nonempty bitmap words */
+     uintptr_t           wordmap[MEM_BUF_SUM_WORDS];
+     uintptr_t           map[MEM_BUF_MAP_WORDS];

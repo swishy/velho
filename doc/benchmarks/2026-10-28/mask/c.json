@@ -1,0 +1,146 @@
+[
+  {
+    "round": 1,
+    "allocator": "before",
+    "seconds": 0.33292382400031784,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "50032\n"
+  },
+  {
+    "round": 1,
+    "allocator": "after",
+    "seconds": 0.35762719699960144,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49904\n"
+  },
+  {
+    "round": 2,
+    "allocator": "after",
+    "seconds": 0.35440873700099473,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49136\n"
+  },
+  {
+    "round": 2,
+    "allocator": "before",
+    "seconds": 0.29443132300002617,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49008\n"
+  },
+  {
+    "round": 3,
+    "allocator": "before",
+    "seconds": 0.3730594749995362,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "48624\n"
+  },
+  {
+    "round": 3,
+    "allocator": "after",
+    "seconds": 0.3654054710004857,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "50032\n"
+  },
+  {
+    "round": 4,
+    "allocator": "after",
+    "seconds": 0.38803866200032644,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "50028\n"
+  },
+  {
+    "round": 4,
+    "allocator": "before",
+    "seconds": 0.36958143900119467,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "48368\n"
+  },
+  {
+    "round": 5,
+    "allocator": "before",
+    "seconds": 0.35687098400012474,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49008\n"
+  },
+  {
+    "round": 5,
+    "allocator": "after",
+    "seconds": 0.343004693999319,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49392\n"
+  },
+  {
+    "round": 6,
+    "allocator": "after",
+    "seconds": 0.3249382890007837,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49904\n"
+  },
+  {
+    "round": 6,
+    "allocator": "before",
+    "seconds": 0.3405590239999583,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "48368\n"
+  },
+  {
+    "round": 7,
+    "allocator": "before",
+    "seconds": 0.3405350240009284,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49648\n"
+  },
+  {
+    "round": 7,
+    "allocator": "after",
+    "seconds": 0.33645353900101327,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49648\n"
+  },
+  {
+    "round": 8,
+    "allocator": "after",
+    "seconds": 0.3312990800004627,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "48364\n"
+  },
+  {
+    "round": 8,
+    "allocator": "before",
+    "seconds": 0.33386255400000664,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "49260\n"
+  },
+  {
+    "round": 9,
+    "allocator": "before",
+    "seconds": 0.3776731819998531,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "48624\n"
+  },
+  {
+    "round": 9,
+    "allocator": "after",
+    "seconds": 0.297550006000165,
+    "returncode": 0,
+    "stdout": "MT OK (8 threads x 150000 iters)\n",
+    "stderr": "43760\n"
+  }
+]

@@ -1,0 +1,9 @@
+THREADED workers=4 count-per-worker=3000
+RSS: 76180 kB
+RSS_PARTIAL: 76376 kB
+RSS_REFILL: 76936 kB
+RSS_FREED: 76940 kB
+RSS_JOINED: 67080 kB
+mean-worker hash-build 164 ms, scan 52 ms, str+sort 118 ms
+mean-worker partial-free 59 ms, refill 217 ms, cleanup 36 ms
+partial free, refill and worker cleanup: PASS
